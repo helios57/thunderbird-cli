@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "child_process";
+import { request } from "http";
 import { mkdtempSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { fileURLToPath } from "url";
@@ -230,6 +231,26 @@ console.log("\n\x1b[1mTime budget and cancellation\x1b[0m");
   await sleep(150);
   const req2 = ext.received.find((r) => r.path === "/messages/search");
   test("a client that hangs up cancels the work in Thunderbird", ext.received.some((r) => r.cancel === true && r.id === req2?.id), true);
+  ext.close();
+  await stopBridge(proc);
+}
+
+console.log("\n\x1b[1mConnection handling\x1b[0m");
+{
+  const { proc } = await startBridge();
+  const ext = await connectExtension();
+  await sleep(50);
+  // A client asking to close must still get keep-alive: the bridge leaves closing to the client
+  // (on Windows, Node closing first intermittently resets large responses before they are read).
+  const headers = await new Promise((resolve) => {
+    const r = request({ host: "127.0.0.1", port: PORT, path: "/messages/search", method: "POST",
+      headers: { "Content-Type": "application/json", Connection: "close" } }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.headers));
+    });
+    r.end("{}");
+  });
+  test("responses keep the connection open even if the client asks to close", headers.connection, "keep-alive");
   ext.close();
   await stopBridge(proc);
 }

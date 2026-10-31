@@ -307,6 +307,12 @@ function forwardToExtension(method, path, body, timeoutMs = DEFAULT_TIMEOUT, sig
 
 const httpServer = createServer(async (req, res) => {
   res.setHeader("Content-Type", "application/json");
+  // Leave closing the connection to the client. If the client sends "Connection: close"
+  // (Python urllib, many scripts), Node otherwise closes right after a large response, and on
+  // Windows that intermittently arrives as a TCP reset before the client has read everything
+  // (seen with ~460 KB attachment downloads: ~1 in 5 failed). Idle sockets still close after
+  // the server keep-alive timeout.
+  res.setHeader("Connection", "keep-alive");
 
   if (!isAllowedHost(req.headers.host)) {
     res.writeHead(403);

@@ -32,6 +32,7 @@ Verified against the Thunderbird 159 WebExtension implementation (`ExtensionMess
 - New tools `email_recent` and `email_identities` (#30); tools carry MCP annotations (read-only / destructive).
 - Corrected tool descriptions: `fullText` is not an index (Thunderbird 159 parses bodies), and matching is case-sensitive.
 
+- **Searches stop in time and return what they found.** The bridge passes its timeout to the extension; newest-first searches stop at 80 % of it and answer with `partial: true` and `searchedBackTo` (everything newer was checked) instead of timing out with nothing. When the bridge still gives up, or the HTTP client hangs up, it sends `{ id, cancel: true }` and the extension aborts the Thunderbird search instead of letting it run on in the background (live: a rare-term full-text search over 129k mails had kept Thunderbird busy for minutes after a 240 s timeout). Extension 2.1.1.3.
 - **Gmail copies collapsed.** Gmail exposes one mail in INBOX, All Mail, Important and every label folder; search, `recent` and threads returned each copy (live: 12 hits = 4 mails). Copies within one account (same Message-ID) are now one result, represented by the inbox copy (then a real label, then All Mail), with the other folders in `alsoIn`; `limit` counts distinct mails. `dedupe: false` returns every copy. Extension 2.1.1.2.
 
 ### Fixed

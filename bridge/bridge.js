@@ -265,19 +265,41 @@ wss.on("close", () => {
 
 // ─── Forward request to extension ───────────────────────────────────
 
-function forwardToExtension(method, path, body, timeoutMs = DEFAULT_TIMEOUT) {
+/** Tell the extension to stop working on a request nobody waits for any more. */
+function cancelOnExtension(socket, id) {
+  try {
+    if (socket?.readyState === 1) socket.send(JSON.stringify({ id, cancel: true }));
+  } catch {}
+}
+
+/**
+ * Forward a request. The extension gets `timeoutMs` so long searches can stop in time and
+ * return what they found (partial) instead of being cut off with nothing; if the bridge still
+ * gives up (timeout) or the HTTP client goes away (`signal`), the extension is told to cancel,
+ * so Thunderbird stops searching instead of grinding on in the background.
+ */
+function forwardToExtension(method, path, body, timeoutMs = DEFAULT_TIMEOUT, signal = null) {
   return new Promise((resolve, reject) => {
     if (!extensionSocket || extensionSocket.readyState !== 1) {
       reject({ message: "Thunderbird extension not connected. Is Thunderbird running?", code: "EXTENSION_DISCONNECTED" });
       return;
     }
     const id = randomUUID();
+    const socket = extensionSocket;
     const timer = setTimeout(() => {
       pending.delete(id);
+      cancelOnExtension(socket, id);
       reject({ message: `Request timed out (${Math.round(timeoutMs / 1000)}s)`, code: "TIMEOUT" });
     }, timeoutMs);
-    pending.set(id, { resolve, reject, timer, socket: extensionSocket });
-    extensionSocket.send(JSON.stringify({ id, method, path, body }));
+    pending.set(id, { resolve, reject, timer, socket });
+    signal?.addEventListener("abort", () => {
+      if (!pending.has(id)) return;
+      pending.delete(id);
+      clearTimeout(timer);
+      cancelOnExtension(socket, id);
+      reject({ message: "Client disconnected", code: "CLIENT_GONE" });
+    }, { once: true });
+    socket.send(JSON.stringify({ id, method, path, body, timeoutMs }));
   });
 }
 
@@ -389,12 +411,17 @@ const httpServer = createServer(async (req, res) => {
     if (parsed > 0) timeoutMs = parsed;
   }
 
-  // Forward to extension
+  // Forward to extension; if the client hangs up first, cancel the work in Thunderbird.
+  const clientGone = new AbortController();
+  res.on("close", () => {
+    if (!res.writableEnded) clientGone.abort();
+  });
   try {
-    const result = await forwardToExtension(req.method, req.url, parsedBody, timeoutMs);
+    const result = await forwardToExtension(req.method, req.url, parsedBody, timeoutMs, clientGone.signal);
     res.writeHead(200);
     res.end(JSON.stringify(result));
   } catch (err) {
+    if (err.code === "CLIENT_GONE") return;
     // Always name the failure: a timeout must never look like an empty result to a client.
     const code = err.code || "THUNDERBIRD_ERROR";
     const status = code === "EXTENSION_DISCONNECTED" ? 503 : code === "TIMEOUT" ? 504 : 500;

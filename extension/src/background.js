@@ -26,6 +26,20 @@ const MAX_NEWEST_SCAN = 20000;
 // API sort names → messages.list() sortType (Thunderbird 128+).
 const LIST_SORT_TYPES = { date: "date", from: "author", subject: "subject", size: "size" };
 let queryPageOption = true;
+// Long searches stop at this share of the bridge's timeout and return what they found, so the
+// answer (marked partial) still arrives before the bridge gives up.
+const SOFT_DEADLINE_SHARE = 0.8;
+const activeRequests = new Map(); // request id → context ({ cancelled, deadline })
+
+function requestContext(timeoutMs) {
+  const ms = Number(timeoutMs);
+  return {
+    cancelled: false,
+    deadline: ms > 0 ? Date.now() + ms * SOFT_DEADLINE_SHARE : Infinity,
+  };
+}
+
+const shouldStop = (ctx) => !!ctx && (ctx.cancelled || Date.now() > ctx.deadline);
 
 let ws = null;
 let reconnectTimer = null;
@@ -65,14 +79,25 @@ function connect() {
       return;
     }
 
+    // The bridge gave up on a request (timeout, client gone): stop its search loop.
+    if (request.cancel) {
+      const running = activeRequests.get(request.id);
+      if (running) running.cancelled = true;
+      return;
+    }
+
+    const ctx = requestContext(request.timeoutMs);
+    activeRequests.set(request.id, ctx);
     try {
-      const result = await handleRequest(request);
+      const result = await handleRequest(request, ctx);
       socket.send(JSON.stringify({ id: request.id, result }));
     } catch (err) {
       socket.send(JSON.stringify({
         id: request.id,
         error: { message: err.message, stack: err.stack },
       }));
+    } finally {
+      activeRequests.delete(request.id);
     }
   };
 
@@ -119,7 +144,7 @@ if (typeof messenger !== "undefined" && messenger.idle?.onStateChanged) {
 
 // ─── Request Router ─────────────────────────────────────────────────
 
-async function handleRequest({ method, path, body }) {
+async function handleRequest({ method, path, body }, ctx = null) {
   // Health
   if (path === "/health") {
     return { status: "ok", version: messenger.runtime.getManifest().version, thunderbird: true };
@@ -257,7 +282,7 @@ async function handleRequest({ method, path, body }) {
       if (headerMessageId || sort === "none") {
         return collectMessages(() => runQuery(q), limit, { offset, keep });
       }
-      return collectNewestPage(q, limit, offset, keep, { dedupe: dedupe !== false });
+      return collectNewestPage(q, limit, offset, keep, { dedupe: dedupe !== false, ctx });
     };
 
     let result;
@@ -686,7 +711,7 @@ async function handleRequest({ method, path, body }) {
     if (!includeJunk) q.junk = false;
     const keep = (msg) =>
       (!unreadOnly || !msg.read) && (!accountId || msg.folder?.accountId === accountId);
-    const result = await collectNewestPage(q, limit, 0, keep, { dedupe: dedupe !== false });
+    const result = await collectNewestPage(q, limit, 0, keep, { dedupe: dedupe !== false, ctx });
     result.since = since.toISOString();
     return result;
   }
@@ -923,8 +948,12 @@ async function collectMessages(queryFn, limit,
  * are never touched. A broad query usually stops after the first slice; a narrow one costs at
  * most four passes, and because Thunderbird checks dates before parsing bodies, text searches
  * only parse messages inside the slices actually visited.
+ *
+ * With a request context (`ctx`), the walk stops when the bridge cancels or the soft deadline
+ * passes, and returns what it has: `partial: true` plus `searchedBackTo`, the date down to which
+ * every message was checked. Hits older than that may be missing.
  */
-async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = true } = {}) {
+async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = true, ctx = null } = {}) {
   const needed = offset + limit;
   const upper = q.toDate ? q.toDate.getTime() : Infinity;
   const lower = q.fromDate ? q.fromDate.getTime() : -Infinity;
@@ -934,11 +963,13 @@ async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = t
 
   // Unique messages (copies collapsed, see addCopy), so `limit` counts distinct mails.
   const found = new Map();
-  let end = upper;
+  let end = upper; // everything newer than `end` (within the query) has been checked
   let truncated = false;
+  let partial = false;
   let slices = 0;
   let exhausted = true;
-  for (let i = 0; i < cuts.length; i++) {
+  for (let i = 0; i < cuts.length && !partial; i++) {
+    if (shouldStop(ctx)) { partial = true; break; }
     const cut = cuts[i];
     const sq = { ...q };
     if (end === Infinity) delete sq.toDate; else sq.toDate = new Date(end);
@@ -956,10 +987,16 @@ async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = t
         abandonList(page);
         break;
       }
+      // Thunderbird hands out a page at least every second, so this check runs often.
+      if (shouldStop(ctx)) {
+        partial = true;
+        abandonList(page);
+        break;
+      }
       page = await messenger.messages.continueList(page.id);
     }
+    if (truncated || partial) break;
     end = cut;
-    if (truncated) break;
     if (found.size >= needed) {
       exhausted = i === cuts.length - 1;
       break;
@@ -968,13 +1005,26 @@ async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = t
 
   const sorted = [...found.values()].sort((a, b) => b.best.date - a.best.date);
   const messages = sorted.slice(offset, needed).map(formatCopies);
-  return {
+  const result = {
     messages, total: messages.length, offset,
-    hasMore: sorted.length > needed || !exhausted,
+    hasMore: sorted.length > needed || !exhausted || partial,
     order: "newest",
     slicesScanned: slices,
-    ...(truncated ? { truncated: true, note: `More than ${MAX_NEWEST_SCAN} hits in one date range; narrow the search (date, account, folder) for exact newest-first order.` } : {}),
   };
+  if (truncated) {
+    result.truncated = true;
+    result.note = `More than ${MAX_NEWEST_SCAN} hits in one date range; narrow the search (date, account, folder) for exact newest-first order.`;
+  }
+  if (partial) {
+    const back = end === Infinity ? null : new Date(end).toISOString();
+    result.partial = true;
+    result.searchedBackTo = back;
+    result.note = ctx?.cancelled
+      ? "Search was cancelled; results are incomplete."
+      : `Time limit reached: every message newer than ${back ? back.slice(0, 10) : "now"} was checked, older ones were not (fully). ` +
+        "Narrow the search (since, accountId, folderId) or continue with until set to that date.";
+  }
+  return result;
 }
 
 /**

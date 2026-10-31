@@ -383,6 +383,42 @@ test("tag and size filters go into the Thunderbird query", calls.query[0]?.tags?
 const fast = await handle("POST", "/messages/search", { subject: "Rechnung", limit: 2, sort: "none" });
 test("sort=none keeps the fast first-found path", fast.order === undefined && fast.messages.length === 2);
 
+// ─── Time budget and cancellation ───────────────────────────────────
+
+console.log("\n\x1b[1mTime budget and cancellation\x1b[0m");
+{
+  const reqCtx = { cancelled: false, deadline: Infinity };
+  // The bridge cancels while the first date slice is being searched.
+  queryHandlers.unshift(() => { reqCtx.cancelled = true; });
+  const cut = await ctx.handleRequest({ method: "POST", path: "/messages/search", body: { subject: "Rechnung", limit: 10 } }, reqCtx);
+  queryHandlers.shift();
+  test("a cancelled search returns what it found so far", cut.partial === true && JSON.stringify(cut.messages.map((m) => m.id)) === "[100,101,102]", JSON.stringify(cut.messages.map((m) => m.id)));
+  test("…and stops walking back", cut.slicesScanned === 1 && cut.hasMore === true);
+  test("…and says so", /cancel/i.test(cut.note || ""));
+
+  const late = await ctx.handleRequest({ method: "POST", path: "/messages/search", body: { subject: "Rechnung", limit: 10 } }, { cancelled: false, deadline: Date.now() - 1 });
+  test("a passed deadline returns a partial result instead of searching on", late.partial === true && late.slicesScanned === 0);
+
+  const reqCtx2 = { cancelled: false, deadline: Infinity };
+  let m = 0;
+  queryHandlers.unshift(() => { if (++m === 2) reqCtx2.deadline = Date.now() - 1; });
+  const budget = await ctx.handleRequest({ method: "POST", path: "/messages/search", body: { subject: "Rechnung alt", limit: 10 } }, reqCtx2);
+  queryHandlers.shift();
+  const days = (Date.now() - new Date(budget.searchedBackTo).getTime()) / DAY;
+  test("a deadline reports how far back the search is complete (last fully searched slice)", budget.partial === true && Math.round(days) === 60, `searchedBackTo=${budget.searchedBackTo}`);
+  test("…with a hint to continue", /until/.test(budget.note || ""));
+}
+{
+  const sock = current; // the connected socket from the reconnect tests
+  const before = sock.sent.length;
+  sock.onmessage({ data: JSON.stringify({ id: "nope", cancel: true }) });
+  await new Promise((r) => setImmediate(r));
+  test("cancel for an unknown request is ignored silently", sock.sent.length === before);
+  sock.onmessage({ data: JSON.stringify({ id: "t1", method: "GET", path: "/health", timeoutMs: 5000 }) });
+  await new Promise((r) => setImmediate(r));
+  test("requests carrying timeoutMs are answered", sock.sent.at(-1)?.id === "t1" && sock.sent.at(-1)?.result?.status === "ok");
+}
+
 // ─── Gmail copies ───────────────────────────────────────────────────
 
 console.log("\n\x1b[1mGmail copies\x1b[0m");

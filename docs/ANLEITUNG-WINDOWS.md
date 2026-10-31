@@ -40,7 +40,7 @@ Das Skript
    sofort gestartet,
 4. trägt den MCP-Server in Claude Code ein (`claude mcp add --scope user thunderbird ...`) und
    kopiert die Skill nach `%USERPROFILE%\.claude\skills\thunderbird-cli`,
-5. baut das Add-on: `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.2.xpi`.
+5. baut das Add-on: `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.3.xpi`.
 
 Erneut ausführen ist unbedenklich. Das Token bleibt, die Stufe wird übernommen, die Bridge neu
 gestartet.
@@ -49,7 +49,7 @@ gestartet.
 
 1. Thunderbird → Menü → **Add-ons und Themes** (`Ctrl+Shift+A`)
 2. Zahnrad oben → **Add-on aus Datei installieren…**
-3. `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.2.xpi` wählen
+3. `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.3.xpi` wählen
 4. Die Berechtigungen (Konten und Nachrichten lesen, verfassen, verschieben …) bestätigen
 
 Das Add-on verbindet sich innerhalb von höchstens 15 Sekunden mit der Bridge.
@@ -148,5 +148,6 @@ Danach das Add-on in Thunderbird entfernen.
 | `EXTENSION_DISCONNECTED` | Thunderbird läuft nicht oder das Add-on ist deaktiviert; nach dem Start bis zu 15 s warten |
 | `AUTH_REQUIRED` | Token passt nicht: Bridge nach Änderungen an `config.json` neu starten |
 | `POLICY_DENIED` | Aktion braucht eine höhere Stufe, siehe oben |
+| `partial: true` | Zeitlimit erreicht: alles neuer als `searchedBackTo` ist durchsucht, ältere Mails nicht. Mit `until` weitersuchen oder eingrenzen |
 | `TIMEOUT` | Suche zu breit: Zeitraum, Konto oder Ordner angeben. Ergebnis ist unbekannt, nicht leer |
 | Port belegt | `Get-NetTCPConnection -LocalPort 7700,7701 \| Select-Object LocalPort, OwningProcess` |

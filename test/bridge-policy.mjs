@@ -206,6 +206,34 @@ console.log("\n\x1b[1mBody limit and disconnects\x1b[0m");
   await stopBridge(proc);
 }
 
+console.log("\n\x1b[1mTime budget and cancellation\x1b[0m");
+{
+  const { proc } = await startBridge();
+  const ext = await connectExtension({ hold: true });
+  await sleep(50);
+  const res = await call("POST", "/messages/search", { query: "slow" }, { "X-TB-Timeout": "300" });
+  await sleep(100);
+  const req = ext.received.find((r) => r.path === "/messages/search");
+  test("the extension is told the time budget", req?.timeoutMs, 300);
+  test("a timed-out request still answers 504", res.status, 504);
+  test("…and the extension is told to cancel it", ext.received.some((r) => r.cancel === true && r.id === req?.id), true);
+
+  ext.received.length = 0;
+  const ac = new AbortController();
+  const gone = fetch(`http://127.0.0.1:${PORT}/messages/search`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-TB-Timeout": "20000" },
+    body: JSON.stringify({ query: "slow" }), signal: ac.signal,
+  }).catch(() => null);
+  await sleep(150);
+  ac.abort();
+  await gone;
+  await sleep(150);
+  const req2 = ext.received.find((r) => r.path === "/messages/search");
+  test("a client that hangs up cancels the work in Thunderbird", ext.received.some((r) => r.cancel === true && r.id === req2?.id), true);
+  ext.close();
+  await stopBridge(proc);
+}
+
 console.log(`\n\x1b[1m${"─".repeat(40)}\x1b[0m`);
 console.log(`\x1b[1m${passed} passed, ${failed} failed, ${passed + failed} total\x1b[0m\n`);
 process.exit(failed > 0 ? 1 : 0);

@@ -70,7 +70,8 @@ export const tools = [
       "Search emails across all accounts, newest first. Filters: sender, recipient, subject, date range, attachments, tags, size. Excludes junk by default. " +
       "Text matching (query, subject, from) is a CASE-SENSITIVE substring match — 'rechnung' does not find 'Rechnung'; try the spelling used in the mail, or search twice. " +
       "On large mailboxes a text query is slowest without a date range: add since/until, accountId or folderId when you can. Use fields to cut tokens. " +
-      "Copies of one mail in several folders of an account (Gmail labels, All Mail) are returned once, with the other folders in alsoIn.",
+      "Copies of one mail in several folders of an account (Gmail labels, All Mail) are returned once, with the other folders in alsoIn. " +
+      "If time runs out the result has partial: true and searchedBackTo: everything newer was checked; continue with until=searchedBackTo or narrow the search.",
     inputSchema: {
       type: "object",
       properties: {

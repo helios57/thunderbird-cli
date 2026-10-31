@@ -55,7 +55,8 @@ function header(id, extra = {}) {
   };
 }
 
-const calls = { query: [], getRaw: [], update: [] };
+const calls = { query: [], getRaw: [], update: [], list: [], abortList: [] };
+let legacyList = false;
 let inFlight = 0, maxInFlight = 0;
 const track = async (fn) => {
   inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
@@ -102,9 +103,22 @@ const messenger = {
       }
       return { messages: [] };
     },
-    // Paginated like Thunderbird (small pages to exercise continueList)
-    list: async () => pageOf([...store.values()].map((s) => s.header), 0),
+    // Paginated like Thunderbird (small pages to exercise continueList). Thunderbird 128+
+    // sorts when given { sortType, sortOrder } (default order: descending); `legacyList`
+    // simulates an older build that rejects list options.
+    list: async (folder, options) => {
+      calls.list.push(options);
+      const all = [...store.values()].map((s) => s.header);
+      if (options) {
+        if (legacyList) throw new Error("Incorrect argument types for messages.list.");
+        const key = { date: (h) => h.date.getTime(), size: (h) => h.size, subject: (h) => h.subject, author: (h) => h.author }[options.sortType];
+        const f = options.sortOrder === "ascending" ? 1 : -1;
+        if (key) all.sort((a, b) => { const x = key(a), y = key(b); return f * (typeof x === "string" ? x.localeCompare(y) : x - y); });
+      }
+      return pageOf(all, 0);
+    },
     continueList: async (id) => pages.get(id)?.() ?? null,
+    abortList: async (id) => { calls.abortList.push(id); pages.delete(id); },
     update: (id, props) => track(async () => { calls.update.push({ id, props }); }),
     getAttachmentFile: async () => {
       const bytes = randomBytes(100_000);
@@ -306,8 +320,83 @@ const unreadNewest = await handle("POST", "/messages/list", { folderId: "f1", li
 test("filters apply before sorting", JSON.stringify(unreadNewest.messages.map((m) => m.id)) === "[29,28]", JSON.stringify(unreadNewest.messages.map((m) => m.id)));
 const lastPage = await handle("POST", "/messages/list", { folderId: "f1", limit: 5, offset: 28, sort: "subject", sortOrder: "asc" });
 test("last sorted page has hasMore=false", lastPage.messages.length === 2 && lastPage.hasMore === false);
-const unsorted = await handle("POST", "/messages/list", { folderId: "f1", limit: 3 });
-test("without sort, listing keeps database order and paging", JSON.stringify(unsorted.messages.map((m) => m.id)) === "[1,2,3]" && unsorted.hasMore === true);
+calls.list.length = 0;
+const defaultList = await handle("POST", "/messages/list", { folderId: "f1", limit: 3 });
+test("without sort, listing defaults to newest first", JSON.stringify(defaultList.messages.map((m) => m.id)) === "[30,29,28]", JSON.stringify(defaultList.messages.map((m) => m.id)));
+test("date sort is delegated to Thunderbird (messages.list options)", calls.list[0]?.sortType === "date" && calls.list[0]?.sortOrder === "descending");
+test("a page cut short aborts the list in Thunderbird", calls.abortList.length > 0);
+const unsorted = await handle("POST", "/messages/list", { folderId: "f1", limit: 3, sort: "none" });
+test("sort=none keeps database order and paging", JSON.stringify(unsorted.messages.map((m) => m.id)) === "[1,2,3]" && unsorted.hasMore === true);
+const byFrom = await handle("POST", "/messages/list", { folderId: "f1", limit: 1, sort: "from" });
+test("sort=from maps to Thunderbird's author sort", calls.list.at(-1)?.sortType === "author" && byFrom.messages.length === 1);
+
+legacyList = true;
+const legacy = await handle("POST", "/messages/list", { folderId: "f1", limit: 3, sort: "date", sortOrder: "desc" });
+legacyList = false;
+test("Thunderbird without list options falls back to sorting the whole folder", JSON.stringify(legacy.messages.map((m) => m.id)) === "[30,29,28]", JSON.stringify(legacy.messages.map((m) => m.id)));
+
+// ─── Newest-first search ────────────────────────────────────────────
+
+console.log("\n\x1b[1mNewest-first search\x1b[0m");
+// Messages spread over three years, stored oldest first (like a real folder database).
+store.clear();
+const DAY = 86400000;
+const ages = [1, 2, 3, 10, 20, 100, 200, 400, 800, 1000]; // days old
+ages.forEach((age, i) => {
+  const id = 100 + i;
+  store.set(id, { header: header(id, { date: new Date(Date.now() - age * DAY), subject: age > 300 ? "Rechnung alt" : "Rechnung", read: age === 2 }) });
+});
+const dbOrder = [...store.values()].map((s) => s.header).reverse(); // oldest first
+queryHandlers.length = 0;
+queryHandlers.push((q) => {
+  const hits = dbOrder.filter((h) =>
+    (!q.fromDate || h.date >= q.fromDate) && (!q.toDate || h.date <= q.toDate) &&
+    (!q.subject || h.subject.includes(q.subject)) && (q.unread === undefined || !h.read));
+  return pageOf(hits, 0);
+});
+
+calls.query.length = 0;
+const top3 = await handle("POST", "/messages/search", { subject: "Rechnung", limit: 3 });
+test("search returns the newest hits, not database order", JSON.stringify(top3.messages.map((m) => m.id)) === "[100,101,102]", JSON.stringify(top3.messages.map((m) => m.id)));
+test("a broad search stops after the first date slice", top3.slicesScanned === 1 && calls.query.length === 1, `slices=${top3.slicesScanned}`);
+test("first slice is bounded by fromDate (dates are checked before bodies)", Object.prototype.toString.call(calls.query[0]?.fromDate) === "[object Date]");
+test("hasMore is set when older slices were skipped", top3.hasMore === true);
+test("queries ask for large pages", calls.query[0]?.messagesPerPage === 500);
+
+const page2 = await handle("POST", "/messages/search", { subject: "Rechnung", limit: 3, offset: 3 });
+test("offset pages continue newest-first", JSON.stringify(page2.messages.map((m) => m.id)) === "[103,104,105]", JSON.stringify(page2.messages.map((m) => m.id)));
+
+const rare = await handle("POST", "/messages/search", { subject: "Rechnung alt", limit: 5 });
+test("a narrow search walks back through all slices", rare.slicesScanned === 4 && JSON.stringify(rare.messages.map((m) => m.id)) === "[107,108,109]", JSON.stringify(rare.messages.map((m) => m.id)));
+test("exhausted search reports hasMore=false", rare.hasMore === false);
+
+const unreadOnly = await handle("POST", "/messages/search", { subject: "Rechnung", unreadOnly: true, limit: 2 });
+test("filters are applied inside the slices", JSON.stringify(unreadOnly.messages.map((m) => m.id)) === "[100,102]", JSON.stringify(unreadOnly.messages.map((m) => m.id)));
+
+const windowed = await handle("POST", "/messages/search", { subject: "Rechnung", fromDate: new Date(Date.now() - 30 * DAY).toISOString(), limit: 10 });
+test("an explicit date range is respected", JSON.stringify(windowed.messages.map((m) => m.id)) === "[100,101,102,103,104]", JSON.stringify(windowed.messages.map((m) => m.id)));
+
+calls.query.length = 0;
+await handle("POST", "/messages/search", { subject: "Rechnung", tag: "$label1", sizeMin: 5, sizeMax: 50 });
+test("tag and size filters go into the Thunderbird query", calls.query[0]?.tags?.tags?.$label1 === true && calls.query[0]?.size?.min === 5 && calls.query[0]?.size?.max === 50);
+
+const fast = await handle("POST", "/messages/search", { subject: "Rechnung", limit: 2, sort: "none" });
+test("sort=none keeps the fast first-found path", fast.order === undefined && fast.messages.length === 2);
+
+// ─── Body parts ─────────────────────────────────────────────────────
+
+console.log("\n\x1b[1mBody parts\x1b[0m");
+store.set(200, {
+  header: header(200),
+  full: { contentType: "multipart/mixed", parts: [
+    { contentType: "text/plain", body: "Hallo", partName: "1.1", headers: {} },
+    { contentType: "text/plain", body: "a;b;c", partName: "1.2", name: "liste.csv", size: 5, headers: { "content-disposition": ["attachment; filename=liste.csv"] } },
+    { contentType: "application/pdf", partName: "1.3", name: "rechnung.pdf", size: 900, headers: {} },
+  ] },
+});
+const withFiles = await handle("GET", "/messages/200");
+test("an attached text file is not merged into the body", withFiles.parts.text === "Hallo", JSON.stringify(withFiles.parts.text));
+test("an attached text file is listed as an attachment", withFiles.parts.attachments.some((a) => a.name === "liste.csv") && withFiles.parts.attachments.some((a) => a.name === "rechnung.pdf"));
 
 // ─── Attachment ─────────────────────────────────────────────────────
 

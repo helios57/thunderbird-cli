@@ -14,6 +14,18 @@ const RECONNECT_MAX_MS = 15000;
 // Max per-message operations (each one or two messenger.* calls) in flight across all requests.
 const IPC_CONCURRENCY = 8;
 const BASE64_CHUNK_SIZE = 0x8000;
+// messages.query() page size (Thunderbird default: 100). Larger pages mean fewer IPC round
+// trips when a date slice holds thousands of hits.
+const QUERY_PAGE_SIZE = 500;
+// Newest-first search walks back through these date slices (days before now), then the rest.
+const NEWEST_SLICES_DAYS = [7, 60, 365];
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Safety cap for one newest-first search: beyond this many hits the result is flagged as
+// truncated instead of holding an unbounded number of headers in memory.
+const MAX_NEWEST_SCAN = 20000;
+// API sort names → messages.list() sortType (Thunderbird 128+).
+const LIST_SORT_TYPES = { date: "date", from: "author", subject: "subject", size: "size" };
+let queryPageOption = true;
 
 let ws = null;
 let reconnectTimer = null;
@@ -201,12 +213,14 @@ async function handleRequest({ method, path, body }) {
 
   if (path === "/messages/search" && method === "POST") {
     const { query, accountId, fromAddress, toAddress, subject,
-            unreadOnly, flagged, limit = 25, fromDate, toDate,
+            unreadOnly, flagged, limit = 25, offset = 0, fromDate, toDate,
             folderId, tag, hasAttachment, sizeMin, sizeMax,
-            includeJunk, headerMessageId, searchMode = "fulltext" } = body || {};
+            includeJunk, headerMessageId, searchMode = "fulltext", sort = "date" } = body || {};
     const q = {};
-    // fullText uses Thunderbird's global search index (subject, body, author) and is fast on
-    // large mailboxes; body scans message bodies and can time out there.
+    // Thunderbird has no index behind messages.query: fullText matches subject/author and
+    // otherwise parses each candidate's MIME body, body always parses it. Both are
+    // case-sensitive substring matches. Date limits are checked before the body, which is
+    // why newest-first slicing (collectNewest) keeps text searches fast on big mailboxes.
     let mode = query ? (searchMode === "body" ? "body" : "fulltext") : null;
     if (mode === "fulltext") q.fullText = query;
     if (mode === "body") q.body = query;
@@ -222,31 +236,41 @@ async function handleRequest({ method, path, body }) {
     if (folderId) q.folderId = folderId;
     if (hasAttachment) q.attachment = true;
     if (!includeJunk) q.junk = false;
+    // Tag and size are evaluated inside Thunderbird, so they no longer shrink a page that was
+    // already cut to `limit` (which used to return fewer hits than existed).
+    if (tag) q.tags = { mode: "all", tags: { [tag]: true } };
+    if (sizeMin || sizeMax) {
+      q.size = {};
+      if (sizeMin) q.size.min = sizeMin;
+      if (sizeMax) q.size.max = sizeMax;
+    }
+    // Kept as a client-side safety net in case a Thunderbird build ignores a criterion.
+    const keep = (msg) => {
+      if (tag && !(msg.tags || []).includes(tag)) return false;
+      if (sizeMin && (msg.size || 0) < sizeMin) return false;
+      if (sizeMax && (msg.size || 0) > sizeMax) return false;
+      return true;
+    };
+
+    const run = () => {
+      if (headerMessageId || sort === "none") {
+        return collectMessages(() => runQuery(q), limit, { offset, keep });
+      }
+      return collectNewestPage(q, limit, offset, keep);
+    };
 
     let result;
     try {
-      result = await collectMessages(() => messenger.messages.query(q), limit);
+      result = await run();
     } catch (e) {
       if (mode !== "fulltext") throw e;
-      // Older Thunderbird without fullText support: fall back to a body scan.
+      // Thunderbird without fullText support: fall back to a body scan.
       delete q.fullText;
       q.body = query;
       mode = "body";
-      result = await collectMessages(() => messenger.messages.query(q), limit);
+      result = await run();
     }
     if (mode) result.searchMode = mode;
-
-    // Client-side filtering for tag, sizeMin, sizeMax
-    if (tag || sizeMin || sizeMax) {
-      result.messages = result.messages.filter((msg) => {
-        if (tag && !(msg.tags || []).includes(tag)) return false;
-        if (sizeMin && (msg.size || 0) < sizeMin) return false;
-        if (sizeMax && (msg.size || 0) > sizeMax) return false;
-        return true;
-      });
-      result.total = result.messages.length;
-    }
-
     return result;
   }
 
@@ -254,20 +278,35 @@ async function handleRequest({ method, path, body }) {
 
   if (path === "/messages/list" && method === "POST") {
     const { folderId, limit = 25, unreadOnly = false,
-            offset = 0, sort, sortOrder = "desc", flagged } = body || {};
+            offset = 0, sort = "date", sortOrder = "desc", flagged } = body || {};
     const folder = await messenger.folders.get(folderId, false);
     if (!folder) return { error: "Folder not found" };
     const filters = { unreadOnly, flaggedOnly: flagged || false };
 
-    if (!sort) {
+    if (sort === "none") {
       return await collectMessages(
         () => messenger.messages.list(folder), limit, { ...filters, offset }
       );
     }
 
-    // Thunderbird lists messages in database order, not by date, so sorting has to see the
-    // whole (filtered) folder before offset/limit are applied — otherwise the "newest" page
-    // is just the first N messages re-ordered.
+    // Thunderbird 128+ sorts inside the folder database (much cheaper than shipping every
+    // header over IPC), so the first page already holds the newest messages.
+    const sortType = LIST_SORT_TYPES[sort];
+    if (sortType) {
+      const native = { sortType, sortOrder: sortOrder === "asc" ? "ascending" : "descending" };
+      let firstPage = null;
+      try {
+        firstPage = await messenger.messages.list(folder, native);
+      } catch {
+        firstPage = null; // older Thunderbird: no list options, sort below instead
+      }
+      if (firstPage) {
+        return await collectMessages(async () => firstPage, limit, { ...filters, offset });
+      }
+    }
+
+    // Fallback: sort the whole (filtered) folder before offset/limit are applied — otherwise
+    // the "newest" page is just the first N messages in database order re-ordered.
     const all = await collectMessages(
       () => messenger.messages.list(folder), Infinity, { ...filters, offset: 0 }
     );
@@ -303,6 +342,7 @@ async function handleRequest({ method, path, body }) {
   // ─── Fetch (force download) ─────────────────────────────────────
 
   if (path === "/messages/fetch" && method === "POST") {
+    body = body || {};
     if (body.messageId) {
       const raw = await messenger.messages.getRaw(body.messageId);
       return { downloaded: true, size: typeof raw === "string" ? raw.length : 0 };
@@ -602,41 +642,24 @@ async function handleRequest({ method, path, body }) {
 
   // ─── Stats (GET — legacy) ──────────────────────────────────────
 
-  if (path === "/stats" && method === "GET") {
+  if (path === "/stats" && (method === "GET" || method === "POST")) {
     const accounts = await messenger.accounts.list(true);
-    const stats = [];
-    for (const account of accounts) {
+    const accts = method === "POST" && body?.accountId
+      ? accounts.filter((a) => a.id === body.accountId)
+      : accounts;
+    const withFolders = method === "POST" && !!body?.folders;
+    // One bounded-parallel pass over every folder of every account instead of one sequential
+    // getFolderInfo() round trip per folder.
+    const stats = await Promise.all(accts.map(async (account) => {
+      const folders = account.rootFolder ? await flattenFolders(account.rootFolder) : [];
       const s = { id: account.id, name: account.name, type: account.type,
         email: account.identities?.[0]?.email || "unknown",
-        folders: 0, unreadTotal: 0, messageTotal: 0 };
-      if (account.rootFolder) await countFolder(account.rootFolder, s);
-      stats.push(s);
-    }
-    return {
-      totalAccounts: stats.length,
-      totalUnread: stats.reduce((s, a) => s + a.unreadTotal, 0),
-      totalMessages: stats.reduce((s, a) => s + a.messageTotal, 0),
-      accounts: stats,
-    };
-  }
-
-  // ─── Stats (POST — enhanced) ───────────────────────────────────
-
-  if (path === "/stats" && method === "POST") {
-    const accounts = await messenger.accounts.list(true);
-    let accts = accounts;
-    if (body && body.accountId) accts = accounts.filter((a) => a.id === body.accountId);
-    const stats = [];
-    for (const account of accts) {
-      const s = { id: account.id, name: account.name, type: account.type,
-        email: account.identities?.[0]?.email || "unknown",
-        folders: 0, unreadTotal: 0, messageTotal: 0 };
-      if (body && body.folders && account.rootFolder) {
-        s.folderDetails = await flattenFolders(account.rootFolder);
-      }
-      if (account.rootFolder) await countFolder(account.rootFolder, s);
-      stats.push(s);
-    }
+        folders: folders.length,
+        unreadTotal: folders.reduce((n, f) => n + f.unreadMessageCount, 0),
+        messageTotal: folders.reduce((n, f) => n + f.totalMessageCount, 0) };
+      if (withFolders) s.folderDetails = folders;
+      return s;
+    }));
     return {
       totalAccounts: stats.length,
       totalUnread: stats.reduce((s, a) => s + a.unreadTotal, 0),
@@ -648,13 +671,17 @@ async function handleRequest({ method, path, body }) {
   // ─── Recent ─────────────────────────────────────────────────────
 
   if (path === "/recent" && method === "POST") {
-    const { hours = 24, limit = 50, accountId, unreadOnly = false } = body || {};
+    const { hours = 24, limit = 50, accountId, unreadOnly = false, includeJunk = false } = body || {};
     const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-    const result = await collectMessages(
-      () => messenger.messages.query({ fromDate: since }), limit,
-      { unreadOnly, accountId: accountId || null }
-    );
-    result.messages.sort((a, b) => new Date(b.date) - new Date(a.date));
+    // Filters go into the query so Thunderbird skips non-matching headers itself; the page
+    // is the true newest `limit` (previously: the first `limit` found, then sorted).
+    const q = { fromDate: since };
+    if (accountId) q.accountId = accountId;
+    if (unreadOnly) q.unread = true;
+    if (!includeJunk) q.junk = false;
+    const keep = (msg) =>
+      (!unreadOnly || !msg.read) && (!accountId || msg.folder?.accountId === accountId);
+    const result = await collectNewestPage(q, limit, 0, keep);
     result.since = since.toISOString();
     return result;
   }
@@ -796,50 +823,69 @@ function formatMessage(msg) {
 function extractParts(part, result = { text: "", html: "", attachments: [] }) {
   if (!part) return result;
   const ct = (part.contentType || "").toLowerCase();
-  if (ct === "text/plain" && part.body) result.text += part.body;
-  else if (ct === "text/html" && part.body) result.html += part.body;
-  else if (part.name || (ct && !ct.startsWith("multipart/"))) {
-    if (part.partName && ct !== "text/plain" && ct !== "text/html") {
-      result.attachments.push({
-        name: part.name || "unnamed", contentType: ct,
-        partName: part.partName, size: part.size,
-      });
-    }
+  // A text/plain or text/html part that is a file (.txt, .csv, .ics, an attached .html) is an
+  // attachment, not body text: concatenating it would bloat the body and hide the file.
+  const disposition = String(part.headers?.["content-disposition"]?.[0] || "").toLowerCase();
+  const isFile = !!part.name || disposition.startsWith("attachment");
+  if (ct === "text/plain" && part.body && !isFile) result.text += part.body;
+  else if (ct === "text/html" && part.body && !isFile) result.html += part.body;
+  else if (part.partName && (isFile || (ct && !ct.startsWith("multipart/")))) {
+    result.attachments.push({
+      name: part.name || "unnamed", contentType: ct,
+      partName: part.partName, size: part.size,
+    });
   }
   if (part.parts) for (const sub of part.parts) extractParts(sub, result);
   return result;
 }
 
-async function flattenFolders(folder, depth = 0) {
-  let info = {};
-  try { info = await messenger.folders.getFolderInfo(folder); } catch {}
-  const result = [{
-    id: folder.id, name: folder.name, path: folder.path,
-    type: folder.type,
-    unreadMessageCount: info.unreadMessageCount || 0,
-    totalMessageCount: info.totalMessageCount || 0,
-    depth,
-  }];
-  if (folder.subFolders) {
-    for (const sub of folder.subFolders) {
-      result.push(...await flattenFolders(sub, depth + 1));
+/** Every folder below (and including) `root`, with message counts, depth-first order. */
+async function flattenFolders(root) {
+  const folders = [];
+  const walk = (folder, depth) => {
+    folders.push({ folder, depth });
+    for (const sub of folder.subFolders || []) walk(sub, depth + 1);
+  };
+  walk(root, 0);
+  // getFolderInfo() is one IPC round trip per folder; run them bounded-parallel.
+  return await mapWithIpcLimit(folders, async ({ folder, depth }) => {
+    let info = {};
+    try { info = await messenger.folders.getFolderInfo(folder); } catch {}
+    return {
+      id: folder.id, name: folder.name, path: folder.path,
+      type: folder.type,
+      unreadMessageCount: info.unreadMessageCount || 0,
+      totalMessageCount: info.totalMessageCount || 0,
+      depth,
+    };
+  });
+}
+
+/** messages.query() with bigger pages: fewer IPC round trips on large result sets. */
+async function runQuery(q) {
+  if (queryPageOption) {
+    try {
+      return await messenger.messages.query({ messagesPerPage: QUERY_PAGE_SIZE, ...q });
+    } catch (e) {
+      // Thunderbird without messagesPerPage rejects the whole query; remember and retry.
+      if (!/messagesPerPage/i.test(e?.message || "")) throw e;
+      queryPageOption = false;
     }
   }
-  return result;
+  return await messenger.messages.query(q);
 }
 
-async function countFolder(folder, stats) {
-  stats.folders++;
-  let info = {};
-  try { info = await messenger.folders.getFolderInfo(folder); } catch {}
-  stats.unreadTotal += info.unreadMessageCount || 0;
-  stats.messageTotal += info.totalMessageCount || 0;
-  if (folder.subFolders) {
-    for (const sub of folder.subFolders) await countFolder(sub, stats);
-  }
+/** Stop a message list we no longer read, so Thunderbird stops searching in the background. */
+function abandonList(page) {
+  if (!page?.id) return;
+  try {
+    const r = messenger.messages.abortList?.(page.id);
+    r?.catch?.(() => {});
+  } catch {}
 }
 
-async function collectMessages(queryFn, limit, { unreadOnly = false, flaggedOnly = false, offset = 0, accountId = null } = {}) {
+async function collectMessages(queryFn, limit,
+  { unreadOnly = false, flaggedOnly = false, offset = 0, accountId = null, keep = null } = {}) {
   let page = await queryFn();
   const messages = [];
   let skipped = 0;
@@ -848,6 +894,7 @@ async function collectMessages(queryFn, limit, { unreadOnly = false, flaggedOnly
       if (unreadOnly && msg.read) continue;
       if (flaggedOnly && !msg.flagged) continue;
       if (accountId && msg.folder?.accountId !== accountId) continue;
+      if (keep && !keep(msg)) continue;
       if (skipped < offset) { skipped++; continue; }
       messages.push(formatMessage(msg));
       if (messages.length >= limit) break;
@@ -856,7 +903,72 @@ async function collectMessages(queryFn, limit, { unreadOnly = false, flaggedOnly
       page = await messenger.messages.continueList(page.id);
     } else break;
   }
-  return { messages, total: messages.length, offset, hasMore: !!page?.id };
+  const hasMore = !!page?.id;
+  if (hasMore) abandonList(page);
+  return { messages, total: messages.length, offset, hasMore };
+}
+
+/**
+ * Newest-first page of a query, without reading the whole mailbox.
+ *
+ * messages.query() returns hits in folder/database order, so "first N found" are typically the
+ * oldest. Instead, query disjoint date slices walking back from now (7 days, 60 days, 1 year,
+ * everything older). Every message in a later slice is older than every message in an earlier
+ * one, so once `offset + limit` hits are collected the newest page is exact and older slices
+ * are never touched. A broad query usually stops after the first slice; a narrow one costs at
+ * most four passes, and because Thunderbird checks dates before parsing bodies, text searches
+ * only parse messages inside the slices actually visited.
+ */
+async function collectNewestPage(q, limit, offset = 0, keep = null) {
+  const needed = offset + limit;
+  const upper = q.toDate ? q.toDate.getTime() : Infinity;
+  const lower = q.fromDate ? q.fromDate.getTime() : -Infinity;
+  const now = Date.now();
+  const cuts = NEWEST_SLICES_DAYS.map((d) => now - d * DAY_MS).filter((t) => t > lower && t < upper);
+  cuts.push(lower);
+
+  const found = new Map();
+  let end = upper;
+  let truncated = false;
+  let slices = 0;
+  let exhausted = true;
+  for (let i = 0; i < cuts.length; i++) {
+    const cut = cuts[i];
+    const sq = { ...q };
+    if (end === Infinity) delete sq.toDate; else sq.toDate = new Date(end);
+    if (cut === -Infinity) delete sq.fromDate; else sq.fromDate = new Date(cut);
+
+    let page = await runQuery(sq);
+    slices++;
+    while (page) {
+      for (const msg of page.messages) {
+        if (!keep || keep(msg)) found.set(msg.id, msg); // slice bounds are inclusive: dedupe
+      }
+      if (!page.id) break;
+      if (found.size >= MAX_NEWEST_SCAN) {
+        truncated = true;
+        abandonList(page);
+        break;
+      }
+      page = await messenger.messages.continueList(page.id);
+    }
+    end = cut;
+    if (truncated) break;
+    if (found.size >= needed) {
+      exhausted = i === cuts.length - 1;
+      break;
+    }
+  }
+
+  const sorted = [...found.values()].sort((a, b) => b.date - a.date);
+  const messages = sorted.slice(offset, needed).map(formatMessage);
+  return {
+    messages, total: messages.length, offset,
+    hasMore: sorted.length > needed || !exhausted,
+    order: "newest",
+    slicesScanned: slices,
+    ...(truncated ? { truncated: true, note: `More than ${MAX_NEWEST_SCAN} hits in one date range; narrow the search (date, account, folder) for exact newest-first order.` } : {}),
+  };
 }
 
 function filterBulkMessages(messages, filters) {

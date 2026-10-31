@@ -38,23 +38,25 @@ Equivalent to `tb health` — returns account count and bridge status. If it err
 - **EXTENSION_DISCONNECTED** — open Thunderbird. The WebExtension auto-connects within 3s of Thunderbird being open.
 - **NOT_FOUND** on account/folder — the user hasn't added that account to Thunderbird yet.
 
-## The 12 MCP tools
+## The 14 MCP tools
 
 Use these; don't reach for the 38-command CLI unless the user explicitly asks for a bulk operation not covered here.
 
 | Tool | Purpose | Safe by default? |
 |---|---|---|
 | `email_stats` | Totals across accounts: message count, unread, flagged, folders | ✅ read-only |
-| `email_search` | Cross-account search with 15 filters (from, to, subject, since, until, unread, flagged, has-attachment, tag, size, include-junk) | ✅ excludes junk unless asked |
-| `email_list` | List folder contents, sortable, paginated | ✅ read-only |
-| `email_read` | Read a message. Modes: `default`, `headers`, `full`, `raw`, `body-only`, `check-download` | ✅ read-only |
+| `email_search` | Cross-account search, **newest first**, with filters (from, to, subject, since, until, unread, flagged, has-attachment, tag, size, include-junk). Text matching is **case-sensitive** | ✅ excludes junk unless asked |
+| `email_recent` | Newest messages of the last N hours across all accounts | ✅ read-only |
+| `email_identities` | Sender identities — use an `id` as `from` in `email_compose` | ✅ read-only |
+| `email_list` | List folder contents, newest first by default, sortable, paginated | ✅ read-only |
+| `email_read` | Read a message. Modes: `default` (text; HTML-only mails converted to text), `headers`, `full`, `raw`, `check-download`. Body capped at 20 000 chars unless `maxBody` | ✅ read-only |
 | `email_thread` | Full conversation thread for a message | ✅ read-only |
 | `email_compose` | New message. `mode: draft` / `open` / `send`. Defaults to `draft` | ✅ draft by default |
 | `email_reply` | Reply to a message. Same modes. Defaults to `draft` | ✅ draft by default |
 | `email_forward` | Forward to a new recipient. Same modes. Defaults to `draft` | ✅ draft by default |
 | `email_mark` | Set read / unread / flagged / unflagged / junk / not-junk; add/remove tags (`addTags`, `removeTags`) or replace them (`tags`) (batch supported) | ✅ reversible |
 | `email_archive` | `operation: archive / move / delete`. `delete` requires `permanent` + `confirm` | ⚠️ confirm for permanent |
-| `email_attachments` | List attachments, or download one (single or `--all`) | ✅ read-only |
+| `email_attachments` | List attachments, or download one — saved to a local folder, the result is the file **path** | ✅ read-only |
 | `email_folders` | List folders, get folder info, trigger sync | ✅ read-only |
 
 ## Core patterns — always apply these
@@ -149,11 +151,11 @@ email_compose
 ### F. "Download the PDF attachment from email 245"
 
 ```
-email_attachments id=245            # lists attachments
-email_attachments id=245 part=1.2 output="/tmp/invoice.pdf"
+email_attachments messageId=245 operation="list"                    # name, size, partName
+email_attachments messageId=245 operation="download" partName="1.2" # → { saved: true, path: "<download folder>/245-1.2-invoice.pdf" }
 ```
 
-Attachment parts use dotted-part notation (e.g., `1.2`). If the user didn't specify which, list them first, confirm, then download.
+The download is written to the download folder (`TB_MCP_DOWNLOAD_DIR`, default `<temp>/thunderbird-cli/attachments`) and the result holds its `path` — open that file to read the PDF or image instead of asking for base64. `inline: true` returns base64, only for small files. Attachment parts use dotted-part notation (e.g., `1.2`). If the user didn't specify which, list them first, confirm, then download.
 
 ### G. "Archive all GitHub notifications older than 30 days"
 
@@ -219,7 +221,7 @@ The `tb-bridge` daemon isn't running. Ask the user to run `tb-bridge` in a termi
 Thunderbird isn't open, or the extension hasn't connected yet. Ask the user to open Thunderbird. It reconnects within 3 seconds.
 
 ### "Tool returns TIMEOUT"
-A timed-out search means the results are **unknown**, not that nothing matched — never report "not found" after a TIMEOUT. For `email_search`, narrow with `since`/`until` or `folderId`, and keep the default `searchMode: "fulltext"` (the `body` mode scans messages and is much slower). If full-text search finds nothing that should exist, Thunderbird's Global Search indexer may be off (Settings → General).
+A timed-out search means the results are **unknown**, not that nothing matched — never report "not found" after a TIMEOUT. For `email_search`, narrow with `since`/`until`, `accountId` or `folderId`. Thunderbird has no index behind this search: a text `query` is matched against subject/author and otherwise each message body is parsed, newest date range first. Matching is **case-sensitive** — if "rechnung" finds nothing, try "Rechnung".
 
 IMAP sync may be slow on first run with many accounts. Retry once after ~10 seconds. If it keeps timing out, suggest the user run `tb sync --account <name>` from the CLI to force a manual sync.
 
@@ -230,7 +232,10 @@ The account name in the request doesn't match any configured account. Call `emai
 The `to` field requires a plain email address string (or array of strings). Display names with brackets (`"Alice <alice@x.com>"`) work; raw RFC 5322 groups don't. If unsure, pass `"alice@example.com"`.
 
 ### Message body comes back as HTML
-Some messages are HTML-only. Thunderbird returns the HTML unless `body-only` is passed with an HTML-to-text pass active. Use `email_read mode="body-only"` and tell the agent to strip tags if presenting to the user.
+In `default` mode HTML-only messages are converted to plain text (`textFromHtml: true`, links kept as `text (url)`). Use `mode="full"` or `includeHtml: true` only when the markup itself matters.
+
+### "POLICY_DENIED"
+The bridge refused the action because of its access policy (`read` / `draft` / `organize` / `full`, default `draft`). Don't retry or work around it. Offer the allowed alternative (e.g. save as draft instead of sending) or tell the user which policy the action needs.
 
 ### Attachment download hangs
 Some IMAP servers don't preload attachments. Call `email_read id=<id> mode="check-download"` first — returns `{downloaded: true/false}`. If false, Thunderbird will download on first open; the attachment may not be immediately ready.

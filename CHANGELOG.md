@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [fork 1.1.1+hardening] — 2026-10-31
+
+Fork `helios57/thunderbird-cli`, on top of upstream PR #26 (1.1.1). Thunderbird extension 2.1.1.1.
+Verified against the Thunderbird 159 WebExtension implementation (`ExtensionMessages.sys.mjs`).
+
+### Security
+- **Bridge access policy** `TB_BRIDGE_POLICY` / `bridge.policy`: `read`, `draft` (default), `organize`, `full`. Enforced in the bridge before anything reaches Thunderbird, so it holds even when an agent's own safeguards are bypassed. `draft` reads everything and saves drafts but never sends or deletes; denied calls get 403 `POLICY_DENIED`. Unclassified routes need `full`.
+- The bridge reads `bridge.authToken` and `bridge.policy` from the shared config file (`~/.config/thunderbird-cli/config.json`, or `TB_CONFIG_PATH`); env vars still win. An unreadable config or empty token aborts startup instead of silently dropping auth.
+- Request bodies are capped (`TB_BRIDGE_MAX_BODY_BYTES`, default 10 MiB → 413).
+
+### Performance (large, multi-account mailboxes)
+- **Newest-first search without reading the mailbox.** `messages.query()` returns hits in storage order and the old code stopped at the first `limit` — usually the *oldest* matches. Search and `recent` now query disjoint date slices walking back from now (7 days, 60 days, 1 year, rest) and stop as soon as the page is exact. Thunderbird checks dates before parsing bodies, so text searches only parse messages in the slices visited.
+- `messages.list()` sorts natively in Thunderbird 128+ (`sortType`/`sortOrder`): the newest page of a folder is one page, not a pass over the whole folder. Listing now defaults to newest first (`sort: "none"` = storage order). Older Thunderbird falls back to the previous full sort.
+- Queries use `messagesPerPage: 500` (fewer IPC round trips) and abandoned lists are aborted (`abortList`) instead of searching on in the background.
+- Tag and size filters run inside Thunderbird's query instead of trimming an already-limited page.
+- `stats` and folder listings fetch folder counts bounded-parallel instead of one sequential round trip per folder; MCP `email_folders all` queries accounts in parallel.
+- The bridge fails in-flight requests immediately when the extension disconnects instead of letting each wait out its timeout.
+
+### Changed (MCP, token use)
+- `email_attachments download` saves the file to `TB_MCP_DOWNLOAD_DIR` (default `<temp>/thunderbird-cli/attachments`) and returns its path; `inline: true` keeps base64.
+- `email_read` default mode converts HTML-only mails to text, drops the HTML part, and caps body text at 20 000 characters (`maxBody`, `0` = unlimited); `full` mode caps HTML too.
+- Tool results are compact JSON; empty header fields are dropped; `fields` selects message fields on search/list/recent/thread.
+- New tools `email_recent` and `email_identities` (#30); tools carry MCP annotations (read-only / destructive).
+- Corrected tool descriptions: `fullText` is not an index (Thunderbird 159 parses bodies), and matching is case-sensitive.
+
+### Fixed
+- Attached text files (`.txt`, `.csv`, `.ics`, attached `.html`) are listed as attachments instead of being merged into the body text.
+- `POST /messages/fetch` with an empty body no longer throws.
+
+### Added
+- Windows setup: `scripts/windows/setup.ps1` (token, policy, hidden autostart via scheduled task, Claude Code MCP + skill, XPI build), `start-bridge.ps1`, `uninstall.ps1`; German guide `docs/ANLEITUNG-WINDOWS.md`.
+- `test/bridge-policy.mjs` (48 tests) and new extension/MCP tests — 319 tests across all suites (201 before).
+
 ## [1.1.1] — 2026-09-15
 
 npm packages 1.1.1; Thunderbird extension 2.1.1.

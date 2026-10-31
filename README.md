@@ -2,6 +2,13 @@
 
 > Give Claude (and other AI agents) full access to your email through Mozilla Thunderbird.
 
+> **Fork notes (`helios57/thunderbird-cli`).** Based on upstream 1.1.1 (PR #26), plus: a bridge
+> **access policy** (`read` / `draft` / `organize` / `full`, default `draft` — never sends or
+> deletes), token and policy from the shared config file, **newest-first search that stays fast on
+> large multi-account mailboxes**, native sorted folder listing, attachments saved to disk instead of
+> base64, HTML mails as text, compact MCP output, and a Windows setup for Claude Code.
+> See [CHANGELOG](CHANGELOG.md) and the German guide [docs/ANLEITUNG-WINDOWS.md](docs/ANLEITUNG-WINDOWS.md).
+
 [![tests](https://github.com/vitalio-sh/thunderbird-cli/actions/workflows/test.yml/badge.svg)](https://github.com/vitalio-sh/thunderbird-cli/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)

@@ -1010,8 +1010,12 @@ async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = t
   const needed = offset + limit;
   const upper = q.toDate ? q.toDate.getTime() : Infinity;
   const lower = q.fromDate ? q.fromDate.getTime() : -Infinity;
-  const now = Date.now();
-  const cuts = NEWEST_SLICES_DAYS.map((d) => now - d * DAY_MS).filter((t) => t > lower && t < upper);
+  // Slices are measured back from the top of the searched range (now, or `until` when a search
+  // is continued), so a continuation again starts with a small slice that can finish in time.
+  // Thunderbird scans a slice folder by folder, not by date, so only finished slices give a
+  // date up to which the search is complete.
+  const anchor = Number.isFinite(upper) ? upper : Date.now();
+  const cuts = NEWEST_SLICES_DAYS.map((d) => anchor - d * DAY_MS).filter((t) => t > lower && t < upper);
   cuts.push(lower);
 
   // Unique messages (copies collapsed, see addCopy), so `limit` counts distinct mails.
@@ -1060,10 +1064,16 @@ async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = t
     const back = end === Infinity ? null : new Date(end).toISOString();
     result.partial = true;
     result.searchedBackTo = back;
-    result.note = ctx?.cancelled
-      ? "Search was cancelled; results are incomplete."
-      : `Time limit reached: every message newer than ${back ? back.slice(0, 10) : "now"} was checked, older ones were not (fully). ` +
+    if (ctx?.cancelled) {
+      result.note = "Search was cancelled; results are incomplete.";
+    } else if (end === upper) {
+      // Not even the first slice finished: there is no date up to which the result is complete.
+      result.note = "Time limit reached before any date range was searched completely. " +
+        "Narrow the search: accountId, folderId, or a shorter since/until window.";
+    } else {
+      result.note = `Time limit reached: every message newer than ${back.slice(0, 10)} was checked, older ones were not (fully). ` +
         "Narrow the search (since, accountId, folderId) or continue with until set to that date.";
+    }
   }
   return result;
 }

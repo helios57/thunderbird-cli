@@ -409,6 +409,15 @@ console.log("\n\x1b[1mTime budget and cancellation\x1b[0m");
 
   const late = await ctx.handleRequest({ method: "POST", path: "/messages/search", body: { subject: "Rechnung", limit: 10 } }, { cancelled: false, deadline: Date.now() - 1 });
   test("a passed deadline returns a partial result instead of searching on", late.partial === true && late.slicesScanned === 0);
+  test("…and says no date range was completed", /before any date range/.test(late.note || ""), late.note);
+
+  calls.query.length = 0;
+  const until = new Date(Date.now() - 200 * DAY);
+  await handle("POST", "/messages/search", { subject: "Rechnung alt", toDate: until.toISOString(), limit: 10 });
+  const firstSlice = calls.query[0];
+  test("a continued search (until) starts with a 7-day slice below until",
+    Math.round((until - firstSlice.fromDate) / DAY) === 7 && firstSlice.toDate.getTime() === until.getTime(),
+    `from=${firstSlice.fromDate?.toISOString?.()} to=${firstSlice.toDate?.toISOString?.()}`);
 
   const reqCtx2 = { cancelled: false, deadline: Infinity };
   let m = 0;

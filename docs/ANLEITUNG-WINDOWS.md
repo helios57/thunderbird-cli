@@ -40,7 +40,7 @@ Das Skript
    sofort gestartet,
 4. trägt den MCP-Server in Claude Code ein (`claude mcp add --scope user thunderbird ...`) und
    kopiert die Skill nach `%USERPROFILE%\.claude\skills\thunderbird-cli`,
-5. baut das Add-on: `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.4.xpi`.
+5. baut das Add-on: `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.5.xpi`.
 
 Erneut ausführen ist unbedenklich. Das Token bleibt, die Stufe wird übernommen, die Bridge neu
 gestartet.
@@ -49,7 +49,7 @@ gestartet.
 
 1. Thunderbird → Menü → **Add-ons und Themes** (`Ctrl+Shift+A`)
 2. Zahnrad oben → **Add-on aus Datei installieren…**
-3. `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.4.xpi` wählen
+3. `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.5.xpi` wählen
 4. Die Berechtigungen (Konten und Nachrichten lesen, verfassen, verschieben …) bestätigen
 
 Das Add-on verbindet sich innerhalb von höchstens 15 Sekunden mit der Bridge.

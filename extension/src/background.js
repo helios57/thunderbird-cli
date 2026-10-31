@@ -25,7 +25,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_NEWEST_SCAN = 20000;
 // API sort names → messages.list() sortType (Thunderbird 128+).
 const LIST_SORT_TYPES = { date: "date", from: "author", subject: "subject", size: "size" };
-let queryPageOption = true;
+const unsupportedQueryProps = new Set(); // query extras this Thunderbird rejected
 // Long searches stop at this share of the bridge's timeout and return what they found, so the
 // answer (marked partial) still arrives before the bridge gives up.
 const SOFT_DEADLINE_SHARE = 0.8;
@@ -82,7 +82,10 @@ function connect() {
     // The bridge gave up on a request (timeout, client gone): stop its search loop.
     if (request.cancel) {
       const running = activeRequests.get(request.id);
-      if (running) running.cancelled = true;
+      if (running) {
+        running.cancelled = true;
+        running.onCancel?.(); // abort the Thunderbird list that is being read right now
+      }
       return;
     }
 
@@ -891,18 +894,68 @@ async function flattenFolders(root) {
   });
 }
 
-/** messages.query() with bigger pages: fewer IPC round trips on large result sets. */
-async function runQuery(q) {
-  if (queryPageOption) {
+/**
+ * messages.query() with optional extras Thunderbird may not know (older builds reject the whole
+ * query for an unknown property): bigger pages by default, plus e.g. returnMessageListId.
+ * An extra that is rejected once is dropped for the rest of the session.
+ */
+async function runQuery(q, extras = {}) {
+  const wanted = { messagesPerPage: QUERY_PAGE_SIZE, ...extras };
+  for (;;) {
+    const opts = {};
+    for (const [k, v] of Object.entries(wanted)) if (!unsupportedQueryProps.has(k)) opts[k] = v;
     try {
-      return await messenger.messages.query({ messagesPerPage: QUERY_PAGE_SIZE, ...q });
+      return await messenger.messages.query({ ...opts, ...q });
     } catch (e) {
-      // Thunderbird without messagesPerPage rejects the whole query; remember and retry.
-      if (!/messagesPerPage/i.test(e?.message || "")) throw e;
-      queryPageOption = false;
+      const bad = Object.keys(opts).find((k) => (e?.message || "").includes(k));
+      if (!bad) throw e;
+      unsupportedQueryProps.add(bad);
     }
   }
-  return await messenger.messages.query(q);
+}
+
+/**
+ * Read a message list to the end, or until stopped. `handle` is what messages.query() returned:
+ * a list id (with returnMessageListId) or a first page (older Thunderbird).
+ *
+ * Thunderbird only hands out a page once it holds at least one hit, so a rare full-text term can
+ * block continueList() for minutes. Holding the list id lets a timer (soft deadline) or the
+ * bridge's cancel abort the list from outside: abortList() makes Thunderbird stop searching and
+ * resolves the pending page with whatever it found.
+ *
+ * onMessage(msg) returns false to stop (cap reached). Resolves to null when the list was read
+ * completely, otherwise "partial" (deadline/cancel) or "truncated" (cap).
+ */
+async function drainList(handle, ctx, onMessage) {
+  let listId = typeof handle === "string" ? handle : null;
+  let page = typeof handle === "string" ? null : handle;
+  let stopped = null;
+  const stop = (why) => {
+    if (!stopped) stopped = why;
+    if (listId) abandonList({ id: listId });
+  };
+  let timer = null;
+  if (ctx && listId) {
+    const left = ctx.deadline - Date.now();
+    if (Number.isFinite(left)) timer = setTimeout(() => stop("partial"), Math.max(0, left));
+    ctx.onCancel = () => stop("partial");
+  }
+  try {
+    if (!page && listId) page = await messenger.messages.continueList(listId);
+    while (page) {
+      for (const msg of page.messages) {
+        if (onMessage(msg) === false) { stop("truncated"); break; }
+      }
+      if (stopped || !page.id) break;
+      listId = page.id;
+      if (shouldStop(ctx)) { stop("partial"); break; }
+      page = await messenger.messages.continueList(page.id);
+    }
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (ctx) ctx.onCancel = null;
+  }
+  return stopped;
 }
 
 /** Stop a message list we no longer read, so Thunderbird stops searching in the background. */
@@ -975,26 +1028,14 @@ async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = t
     if (end === Infinity) delete sq.toDate; else sq.toDate = new Date(end);
     if (cut === -Infinity) delete sq.fromDate; else sq.fromDate = new Date(cut);
 
-    let page = await runQuery(sq);
+    const handle = await runQuery(sq, { returnMessageListId: true });
     slices++;
-    while (page) {
-      for (const msg of page.messages) {
-        if (!keep || keep(msg)) addCopy(found, msg, dedupe);
-      }
-      if (!page.id) break;
-      if (found.size >= MAX_NEWEST_SCAN) {
-        truncated = true;
-        abandonList(page);
-        break;
-      }
-      // Thunderbird hands out a page at least every second, so this check runs often.
-      if (shouldStop(ctx)) {
-        partial = true;
-        abandonList(page);
-        break;
-      }
-      page = await messenger.messages.continueList(page.id);
-    }
+    const stopped = await drainList(handle, ctx, (msg) => {
+      if (!keep || keep(msg)) addCopy(found, msg, dedupe);
+      return found.size < MAX_NEWEST_SCAN;
+    });
+    if (stopped === "truncated") truncated = true;
+    if (stopped === "partial") partial = true;
     if (truncated || partial) break;
     end = cut;
     if (found.size >= needed) {

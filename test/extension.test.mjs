@@ -57,6 +57,8 @@ function header(id, extra = {}) {
 
 const calls = { query: [], getRaw: [], update: [], list: [], abortList: [] };
 let legacyList = false;
+let listSeq = 0;
+let onAbort = null;
 let inFlight = 0, maxInFlight = 0;
 const track = async (fn) => {
   inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
@@ -97,11 +99,19 @@ const messenger = {
     }),
     query: async (q) => {
       calls.query.push(q);
+      let result = { messages: [] };
       for (const h of queryHandlers) {
         const r = h(q);
-        if (r) return r;
+        if (r) { result = r; break; }
       }
-      return { messages: [] };
+      // Like Thunderbird: with returnMessageListId the list id comes back at once and the first
+      // page is fetched with continueList (a handler may return a Promise = a page still pending).
+      if (q.returnMessageListId) {
+        const id = `list-${++listSeq}`;
+        pages.set(id, async () => await result);
+        return id;
+      }
+      return result;
     },
     // Paginated like Thunderbird (small pages to exercise continueList). Thunderbird 128+
     // sorts when given { sortType, sortOrder } (default order: descending); `legacyList`
@@ -118,7 +128,8 @@ const messenger = {
       return pageOf(all, 0);
     },
     continueList: async (id) => pages.get(id)?.() ?? null,
-    abortList: async (id) => { calls.abortList.push(id); pages.delete(id); },
+    // Thunderbird's abortList() resolves the pending page with what was found so far.
+    abortList: async (id) => { calls.abortList.push(id); pages.delete(id); onAbort?.(id); },
     update: (id, props) => track(async () => { calls.update.push({ id, props }); }),
     getAttachmentFile: async () => {
       const bytes = randomBytes(100_000);
@@ -407,6 +418,37 @@ console.log("\n\x1b[1mTime budget and cancellation\x1b[0m");
   const days = (Date.now() - new Date(budget.searchedBackTo).getTime()) / DAY;
   test("a deadline reports how far back the search is complete (last fully searched slice)", budget.partial === true && Math.round(days) === 60, `searchedBackTo=${budget.searchedBackTo}`);
   test("…with a hint to continue", /until/.test(budget.note || ""));
+}
+{
+  // Thunderbird holds back an empty page: continueList() blocks until a hit arrives or the list
+  // is aborted. This is the rare-term full-text case that used to run into the bridge timeout.
+  const ticks = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
+  let release = null;
+  onAbort = () => release?.({ messages: [header(500, { subject: "Seltenes Wort", date: new Date() })] });
+  queryHandlers.unshift((q) => q.subject === "Seltenes Wort" && new Promise((r) => { release = r; }));
+
+  const abortsBefore = calls.abortList.length;
+  const reqCtx = { cancelled: false, deadline: Date.now() + 60000 };
+  const blocked = ctx.handleRequest({ method: "POST", path: "/messages/search", body: { subject: "Seltenes Wort", limit: 10 } }, reqCtx);
+  await ticks();
+  const deadlineTimer = pendingTimers().filter((t) => t.ms > 1000).at(-1);
+  test("the search arms a deadline timer while Thunderbird blocks", !!deadlineTimer);
+  deadlineTimer.fired = true;
+  deadlineTimer.fn();
+  const res = await blocked;
+  test("the deadline aborts the waiting Thunderbird list", calls.abortList.length > abortsBefore && res.partial === true, JSON.stringify({ partial: res.partial }));
+  test("…and keeps what Thunderbird had found", res.messages.some((m) => m.id === 500));
+
+  const sock = current;
+  sock.onmessage({ data: JSON.stringify({ id: "blk", method: "POST", path: "/messages/search", body: { subject: "Seltenes Wort", limit: 10 }, timeoutMs: 60000 }) });
+  await ticks();
+  test("a blocked search has not answered yet", !sock.sent.some((s) => s.id === "blk"));
+  sock.onmessage({ data: JSON.stringify({ id: "blk", cancel: true }) });
+  await ticks();
+  const reply = sock.sent.find((s) => s.id === "blk");
+  test("a cancel from the bridge aborts a blocked search at once", reply?.result?.partial === true && /cancel/i.test(reply.result.note || ""), JSON.stringify(reply?.result?.note));
+  queryHandlers.shift();
+  onAbort = null;
 }
 {
   const sock = current; // the connected socket from the reconnect tests

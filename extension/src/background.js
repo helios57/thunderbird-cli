@@ -1097,8 +1097,8 @@ function copyRank(msg) {
 
 /**
  * Add a header to a Map of unique messages, collapsing copies of the same mail within one
- * account (same Message-ID). Copies in different accounts stay separate: "sent by Luc" and
- * "received by Mirella" are different facts. Same id twice (inclusive slice bounds) is ignored.
+ * account (same Message-ID). Copies in different accounts stay separate: "sent from account A"
+ * and "received in account B" are different facts. Same id twice (inclusive slice bounds) is ignored.
  * Returns the message's key in `found`.
  */
 function addCopy(found, msg, dedupe = true) {

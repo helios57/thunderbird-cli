@@ -13,6 +13,8 @@ import { randomUUID, randomUUID as uuid } from "crypto";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MCP_SERVER = join(__dirname, "../mcp/src/server.js");
@@ -95,6 +97,19 @@ function handle({ method, path, body }) {
       ],
       total: 1,
     };
+  if (path === "/messages/77" && method === "GET")
+    return {
+      id: 77, subject: "Rechnung", author: "shop@example.ch", ccList: [], bccList: [], tags: [],
+      parts: {
+        text: "",
+        html: "<html><head><style>p{color:red}</style></head><body><p>Rechnung &amp; Betrag:<br>CHF&nbsp;12.50 f&uuml;r M&auml;rz</p><a href=\"https://pay.example.ch/x\">Jetzt zahlen</a><script>track()</script></body></html>",
+        attachments: [],
+      },
+    };
+  if (path === "/messages/78" && method === "GET")
+    return { id: 78, subject: "Long", parts: { text: "x".repeat(30000), html: "<p>" + "x".repeat(30000) + "</p>", attachments: [] } };
+  if (path === "/identities") return [{ id: "id1", email: "t@t.com", name: "T", accountId: "acct1" }];
+  if (path === "/recent") return { messages: [{ id: 5, subject: "Neu", tags: [], ccList: [] }], total: 1, _body: body };
   if (path?.match(/^\/messages\/\d+$/) && method === "GET")
     return {
       id: 1,
@@ -300,9 +315,12 @@ function test(name, result, check) {
 const servers = await startBridge();
 await new Promise((r) => setTimeout(r, 300));
 
+const DOWNLOAD_DIR = mkdtempSync(join(tmpdir(), "tb-mcp-dl-"));
 const client = new McpClient(MCP_SERVER, {
   TB_BRIDGE_HOST: "127.0.0.1",
   TB_BRIDGE_PORT: String(PORT),
+  TB_MCP_DOWNLOAD_DIR: DOWNLOAD_DIR,
+  TB_CONFIG_PATH: join(__dirname, "__no_config__.json"),
 });
 
 console.log("\n\x1b[1m=== thunderbird-cli MCP Server Tests ===\x1b[0m\n");
@@ -311,12 +329,16 @@ await client.initialize();
 
 console.log("\x1b[1mProtocol\x1b[0m");
 const toolList = await client.listTools();
-test("tools/list returns 12 tools", toolList, (r) => Array.isArray(r) && r.length === 12);
+test("tools/list returns 14 tools", toolList, (r) => Array.isArray(r) && r.length === 14);
 test("each tool has name+description+inputSchema", toolList, (r) =>
   r.every((t) => t.name && t.description && t.inputSchema)
 );
+test("read tools are annotated read-only", toolList, (r) =>
+  r.find((t) => t.name === "email_search")?.annotations?.readOnlyHint === true &&
+  r.find((t) => t.name === "email_archive")?.annotations?.destructiveHint === true
+);
 
-console.log("\n\x1b[1mTools (12)\x1b[0m");
+console.log("\n\x1b[1mTools (14)\x1b[0m");
 
 test("email_stats", await client.callTool("email_stats", {}), (r) => r.totalAccounts === 1);
 test(
@@ -523,14 +545,63 @@ test(
   await client.callTool("email_attachments", { messageId: 1, operation: "list" }),
   (r) => Array.isArray(r) && r.length > 0
 );
+const saved = await client.callTool("email_attachments", {
+  messageId: 1,
+  operation: "download",
+  partName: "1.2",
+});
+test("email_attachments download saves to disk and returns the path", saved, (r) =>
+  r.saved === true && typeof r.path === "string" && r.path.startsWith(DOWNLOAD_DIR) && r.data === undefined
+);
+test("saved attachment holds the decoded bytes", saved, (r) =>
+  existsSync(r.path) && readFileSync(r.path, "utf-8") === "Hello" && r.size === 5
+);
 test(
-  "email_attachments download",
-  await client.callTool("email_attachments", {
-    messageId: 1,
-    operation: "download",
-    partName: "1.2",
-  }),
-  (r) => r.data
+  "email_attachments download inline=true returns base64",
+  await client.callTool("email_attachments", { messageId: 1, operation: "download", partName: "1.2", inline: true }),
+  (r) => r.data === "SGVsbG8="
+);
+
+console.log("\n\x1b[1mToken-efficient output\x1b[0m");
+const raw = await client.send("tools/call", { name: "email_search", arguments: { query: "x" } });
+test("results are compact JSON (no indentation)", raw, (r) => !r.result.content[0].text.includes("\n  "));
+test("empty header fields are dropped", await client.callTool("email_search", { query: "x" }), (r) =>
+  r.messages[0].tags === undefined && r.messages[0].subject === "Test"
+);
+test("fields selects message fields", await client.callTool("email_search", { query: "x", fields: ["id", "subject"] }), (r) =>
+  JSON.stringify(Object.keys(r.messages[0])) === JSON.stringify(["id", "subject"])
+);
+test("search defaults to newest order", await client.callTool("email_search", { query: "x" }), (r) => r._body.sort === undefined);
+test("order=any requests storage order", await client.callTool("email_search", { query: "x", order: "any", offset: 25 }), (r) =>
+  r._body.sort === "none" && r._body.offset === 25
+);
+const html = await client.callTool("email_read", { messageId: 77 });
+test("HTML-only mail is returned as text", html, (r) =>
+  r.parts.textFromHtml === true && r.parts.text.includes("Rechnung & Betrag:\nCHF 12.50 für März")
+);
+test("HTML conversion keeps link targets and drops script/style", html, (r) =>
+  r.parts.text.includes("Jetzt zahlen (https://pay.example.ch/x)") && !r.parts.text.includes("track()") && !r.parts.text.includes("color:red")
+);
+test("default read drops the HTML part and empty fields", html, (r) =>
+  r.parts.html === undefined && r.ccList === undefined && r.parts.attachments === undefined
+);
+test("includeHtml keeps the HTML", await client.callTool("email_read", { messageId: 77, includeHtml: true }), (r) =>
+  typeof r.parts.html === "string" && r.parts.html.includes("<p>")
+);
+test("long bodies are capped by default", await client.callTool("email_read", { messageId: 78 }), (r) =>
+  r.parts.textTruncated === true && r.parts.text.length < 20100
+);
+test("maxBody 0 disables the cap", await client.callTool("email_read", { messageId: 78, maxBody: 0 }), (r) =>
+  r.parts.text.length === 30000 && !r.parts.textTruncated
+);
+test("full mode caps HTML too", await client.callTool("email_read", { messageId: 1, mode: "full", maxBody: 3 }), (r) =>
+  r.parts.htmlTruncated === true
+);
+test("email_identities lists sender identities", await client.callTool("email_identities", {}), (r) =>
+  Array.isArray(r) && r[0].id === "id1"
+);
+test("email_recent forwards hours/unread", await client.callTool("email_recent", { hours: 6, unread: true }), (r) =>
+  r._body.hours === 6 && r._body.unreadOnly === true && r.messages[0].ccList === undefined
 );
 
 test(
@@ -571,6 +642,7 @@ if (failures.length > 0) {
 }
 
 client.close();
+rmSync(DOWNLOAD_DIR, { recursive: true, force: true });
 servers.mock.close();
 servers.wss.close();
 servers.httpServer.close();

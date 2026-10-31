@@ -49,12 +49,32 @@ const server = new Server(
 
 // ─── Handlers ──────────────────────────────────────────────────────
 
+// MCP tool annotations: let clients tell reading from changing. Hints only — the bridge
+// policy (TB_BRIDGE_POLICY) is what actually enforces limits.
+const ANNOTATIONS = {
+  email_stats: { readOnlyHint: true },
+  email_search: { readOnlyHint: true },
+  email_recent: { readOnlyHint: true },
+  email_identities: { readOnlyHint: true },
+  email_list: { readOnlyHint: true },
+  email_read: { readOnlyHint: true },
+  email_thread: { readOnlyHint: true },
+  email_attachments: { readOnlyHint: true },
+  email_folders: { readOnlyHint: true },
+  email_compose: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  email_reply: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  email_forward: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+  email_mark: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  email_archive: { readOnlyHint: false, destructiveHint: true },
+};
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
-    tools: tools.map(({ name, description, inputSchema }) => ({
+    tools: tools.map(({ name, description, inputSchema, annotations }) => ({
       name,
       description,
       inputSchema,
+      annotations: annotations || ANNOTATIONS[name],
     })),
   };
 });
@@ -72,8 +92,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     const result = await tool.handler(args || {}, api);
+    // Compact JSON: indentation is ~25–40% of the characters in a message list and carries
+    // nothing for a model.
     return {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      content: [{ type: "text", text: JSON.stringify(result) }],
+      ...(result && typeof result === "object" && "error" in result && Object.keys(result).length <= 2
+        ? { isError: true }
+        : {}),
     };
   } catch (err) {
     return {

@@ -7,10 +7,13 @@ import { homedir } from "os";
 import { join } from "path";
 
 // Config file paths — check both locations
-const CONFIG_PATHS = [
-  join(homedir(), ".config", "thunderbird-cli", "config.json"),
-  join(homedir(), ".config", "thunderbird-ai", "config.json"),
-];
+// TB_CONFIG_PATH points all three parts (bridge, tb, tb-mcp) at one file, e.g. for tests.
+const CONFIG_PATHS = process.env.TB_CONFIG_PATH
+  ? [process.env.TB_CONFIG_PATH]
+  : [
+      join(homedir(), ".config", "thunderbird-cli", "config.json"),
+      join(homedir(), ".config", "thunderbird-ai", "config.json"),
+    ];
 
 function loadConfig() {
   const defaults = {
@@ -28,7 +31,7 @@ function loadConfig() {
   for (const p of CONFIG_PATHS) {
     if (existsSync(p)) {
       try {
-        fileConfig = JSON.parse(readFileSync(p, "utf-8"));
+        fileConfig = JSON.parse(readFileSync(p, "utf-8").replace(/^\uFEFF/, ""));
         break;
       } catch {}
     }

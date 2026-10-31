@@ -11,6 +11,26 @@
  */
 
 import { parseRelativeDate } from "./client.js";
+import { htmlToText, saveAttachment, shapeMessages, pickFields } from "./format.js";
+
+// Default cap on body text returned by email_read (characters). Keeps one long newsletter from
+// eating the agent's context; pass maxBody: 0 for no limit.
+const DEFAULT_MAX_BODY = 20000;
+// Newest-first search over a big mailbox can take a while (Thunderbird has no search index for
+// messages.query, so text queries parse bodies). Give it time before declaring a timeout.
+const SEARCH_TIMEOUT_MS = 120000;
+
+const FIELDS_SCHEMA = {
+  type: "array",
+  items: { type: "string" },
+  description:
+    "Only return these message fields, e.g. [\"id\",\"date\",\"author\",\"subject\"] — cheapest for scanning many results. Default: all non-empty fields.",
+};
+
+function truncate(text, max) {
+  if (!max || !text || text.length <= max) return { text, truncated: false };
+  return { text: text.slice(0, max) + "\n...[truncated]", truncated: true };
+}
 
 export const tools = [
   // ─── 1. Stats ──────────────────────────────────────────────────
@@ -47,20 +67,30 @@ export const tools = [
   {
     name: "email_search",
     description:
-      "Search for emails across all accounts. Supports filters by sender, recipient, subject, date range, attachments, tags. Excludes junk by default. Use --fields to minimize token cost.",
+      "Search emails across all accounts, newest first. Filters: sender, recipient, subject, date range, attachments, tags, size. Excludes junk by default. " +
+      "Text matching (query, subject, from) is a CASE-SENSITIVE substring match — 'rechnung' does not find 'Rechnung'; try the spelling used in the mail, or search twice. " +
+      "On large mailboxes a text query is slowest without a date range: add since/until, accountId or folderId when you can. Use fields to cut tokens.",
     inputSchema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description: "Full-text search query. Optional when at least one filter is given",
+          description: "Text to find. Optional when at least one filter is given",
         },
         searchMode: {
           type: "string",
           enum: ["fulltext", "body"],
           description:
-            "fulltext (default): Thunderbird's search index over subject, body and author — fast on large mailboxes, needs Global Search enabled in Thunderbird. body: scans message bodies directly — slow, may time out on big folders.",
+            "fulltext (default): matches subject or author, otherwise the body. body: body only. Neither uses an index — both parse message bodies, so narrow by date/account/folder on big mailboxes.",
         },
+        order: {
+          type: "string",
+          enum: ["newest", "any"],
+          description:
+            "newest (default): the most recent matches first, exact even across many accounts. any: first matches found in storage order — faster, but usually the oldest.",
+        },
+        offset: { type: "number", description: "Skip the first N results (pagination, newest order)" },
+        fields: FIELDS_SCHEMA,
         accountId: { type: "string", description: "Limit to specific account" },
         folderId: { type: "string", description: "Limit to specific folder" },
         from: { type: "string", description: "Filter by sender address" },
@@ -100,6 +130,8 @@ export const tools = [
       const body = { limit: args.limit || 25 };
       if (query) body.query = query;
       if (args.searchMode) body.searchMode = args.searchMode;
+      if (args.offset) body.offset = args.offset;
+      if (args.order === "any") body.sort = "none";
       if (args.accountId) body.accountId = args.accountId;
       if (args.folderId) body.folderId = args.folderId;
       if (args.from) body.fromAddress = args.from;
@@ -115,22 +147,58 @@ export const tools = [
       if (args.sizeMax) body.sizeMax = args.sizeMax;
       if (args.includeJunk) body.includeJunk = true;
       try {
-        return await api("POST", "/messages/search", body);
+        return shapeMessages(await api("POST", "/messages/search", body, SEARCH_TIMEOUT_MS), args.fields);
       } catch (err) {
         if (err.code === "TIMEOUT") {
           err.message =
-            "Search timed out before finishing — results are UNKNOWN, not empty. Narrow it with since/until or folderId, or use searchMode \"fulltext\".";
+            "Search timed out before finishing — results are UNKNOWN, not empty. Narrow it with since/until, accountId or folderId.";
         }
         throw err;
       }
     },
   },
 
+  // ─── 2b. Recent ────────────────────────────────────────────────
+  {
+    name: "email_recent",
+    description:
+      "Newest messages across all accounts (or one account) from the last N hours, newest first. Cheapest way to answer 'what came in today?'.",
+    annotations: { readOnlyHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        hours: { type: "number", description: "Look back this many hours (default 24)" },
+        accountId: { type: "string", description: "Limit to one account" },
+        unread: { type: "boolean", description: "Unread only" },
+        includeJunk: { type: "boolean", description: "Include junk (default false)" },
+        limit: { type: "number", description: "Max results (default 50)" },
+        fields: FIELDS_SCHEMA,
+      },
+    },
+    handler: async (args, api) => {
+      const body = { hours: args.hours || 24, limit: args.limit || 50 };
+      if (args.accountId) body.accountId = args.accountId;
+      if (args.unread) body.unreadOnly = true;
+      if (args.includeJunk) body.includeJunk = true;
+      return shapeMessages(await api("POST", "/recent", body, SEARCH_TIMEOUT_MS), args.fields);
+    },
+  },
+
+  // ─── 2c. Identities ────────────────────────────────────────────
+  {
+    name: "email_identities",
+    description:
+      "List sender identities (id, email, name, accountId). Use an id as `from` in email_compose to choose the sending address.",
+    annotations: { readOnlyHint: true },
+    inputSchema: { type: "object", properties: {} },
+    handler: async (args, api) => await api("GET", "/identities"),
+  },
+
   // ─── 3. List ───────────────────────────────────────────────────
   {
     name: "email_list",
     description:
-      "List messages in a specific folder. Use email_folders first to get folder IDs. Supports pagination and sorting.",
+      "List messages in one folder, newest first by default. Use email_folders first to get folder IDs. Supports pagination and sorting.",
     inputSchema: {
       type: "object",
       properties: {
@@ -143,15 +211,16 @@ export const tools = [
         offset: { type: "number", description: "Skip first N (pagination)" },
         sort: {
           type: "string",
-          enum: ["date", "from", "subject", "size"],
-          description: "Sort field",
+          enum: ["date", "from", "subject", "size", "none"],
+          description: "Sort field (default date). none = storage order, fastest",
         },
         sortOrder: {
           type: "string",
           enum: ["asc", "desc"],
-          description: "Sort direction",
+          description: "Sort direction (default desc = newest/largest first)",
         },
         limit: { type: "number", description: "Max results", default: 25 },
+        fields: FIELDS_SCHEMA,
       },
       required: ["folderId"],
     },
@@ -162,7 +231,7 @@ export const tools = [
       if (args.offset) body.offset = args.offset;
       if (args.sort) body.sort = args.sort;
       if (args.sortOrder) body.sortOrder = args.sortOrder;
-      return await api("POST", "/messages/list", body);
+      return shapeMessages(await api("POST", "/messages/list", body, SEARCH_TIMEOUT_MS), args.fields);
     },
   },
 
@@ -170,7 +239,8 @@ export const tools = [
   {
     name: "email_read",
     description:
-      "Read a specific email message. Modes: 'default' (headers + text body), 'headers' (cheapest), 'full' (with HTML), 'raw' (RFC822). Use maxBody to truncate long messages.",
+      "Read one email. Modes: 'default' (headers + plain-text body; HTML-only mails are converted to text), 'headers' (cheapest), 'full' (also the raw HTML), 'raw' (RFC822 source). " +
+      `Body text is capped at ${DEFAULT_MAX_BODY} characters unless maxBody says otherwise (0 = no cap). Attachments are listed with partName for email_attachments.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -186,7 +256,11 @@ export const tools = [
         },
         maxBody: {
           type: "number",
-          description: "Truncate body to N characters",
+          description: `Truncate body text (and HTML in full mode) to N characters. Default ${DEFAULT_MAX_BODY}; 0 = unlimited`,
+        },
+        includeHtml: {
+          type: "boolean",
+          description: "default mode: also return the HTML part (normally dropped to save tokens)",
         },
       },
       required: ["messageId"],
@@ -194,6 +268,7 @@ export const tools = [
     handler: async (args, api) => {
       const id = args.messageId;
       const mode = args.mode || "default";
+      const maxBody = args.maxBody ?? DEFAULT_MAX_BODY;
       let result;
       if (mode === "raw") result = await api("GET", `/messages/${id}/raw`);
       else if (mode === "headers") result = await api("GET", `/messages/${id}/headers`);
@@ -202,10 +277,33 @@ export const tools = [
         result = await api("GET", `/messages/${id}/check-download`);
       else result = await api("GET", `/messages/${id}`);
 
-      // Apply maxBody truncation
-      if (args.maxBody && result?.parts?.text && result.parts.text.length > args.maxBody) {
-        result.parts.text = result.parts.text.slice(0, args.maxBody) + "\n...[truncated]";
-        result.parts.textTruncated = true;
+      if (result && typeof result === "object" && !Array.isArray(result) && mode !== "raw") {
+        result = pickFields(result); // drop empty header fields
+      }
+      const parts = result?.parts;
+      if (parts) {
+        if (mode === "default") {
+          // HTML roughly triples the size of the same text; agents read the text.
+          if (!parts.text && parts.html) {
+            parts.text = htmlToText(parts.html);
+            parts.textFromHtml = true;
+          }
+          if (!args.includeHtml) delete parts.html;
+        }
+        const t = truncate(parts.text, maxBody);
+        parts.text = t.text;
+        if (t.truncated) parts.textTruncated = true;
+        if (parts.html) {
+          const h = truncate(parts.html, maxBody);
+          parts.html = h.text;
+          if (h.truncated) parts.htmlTruncated = true;
+        }
+        if (Array.isArray(parts.attachments) && parts.attachments.length === 0) delete parts.attachments;
+      }
+      if (mode === "raw" && typeof result?.raw === "string") {
+        const r = truncate(result.raw, maxBody);
+        result.raw = r.text;
+        if (r.truncated) result.rawTruncated = true;
       }
       return result;
     },
@@ -220,11 +318,16 @@ export const tools = [
       type: "object",
       properties: {
         messageId: { type: "number", description: "Message ID" },
+        fields: FIELDS_SCHEMA,
       },
       required: ["messageId"],
     },
     handler: async (args, api) => {
-      return await api("GET", `/messages/${args.messageId}/thread`);
+      const result = await api("GET", `/messages/${args.messageId}/thread`, null, SEARCH_TIMEOUT_MS);
+      if (result && Array.isArray(result.thread)) {
+        return { ...result, thread: shapeMessages(result.thread, args.fields) };
+      }
+      return result;
     },
   },
 
@@ -252,7 +355,7 @@ export const tools = [
         from: {
           type: "string",
           description:
-            "Identity ID to send from (use email_identities-equivalent or check email_stats for accounts)",
+            "Identity ID to send from — get it from email_identities",
         },
         priority: {
           type: "string",
@@ -475,7 +578,9 @@ export const tools = [
   {
     name: "email_attachments",
     description:
-      "List or download attachments from a message. Operation 'list' returns attachment metadata. Operation 'download' returns base64-encoded file data (use partName from list results).",
+      "List or download attachments from a message. 'list' returns metadata (name, contentType, size, partName). " +
+      "'download' saves the file to a local download folder and returns its path — open it from there (e.g. read a PDF or image). Set inline=true only if you need the bytes as base64 in the response.",
+    annotations: { readOnlyHint: true },
     inputSchema: {
       type: "object",
       properties: {
@@ -489,6 +594,10 @@ export const tools = [
           type: "string",
           description: "Required for download — get from list operation",
         },
+        inline: {
+          type: "boolean",
+          description: "download: return base64 data instead of saving to disk (large!)",
+        },
       },
       required: ["messageId", "operation"],
     },
@@ -498,9 +607,11 @@ export const tools = [
       }
       if (args.operation === "download") {
         if (!args.partName) return { error: "partName required for download" };
-        return await api("POST", `/messages/${args.messageId}/attachment`, {
+        const file = await api("POST", `/messages/${args.messageId}/attachment`, {
           partName: args.partName,
-        });
+        }, SEARCH_TIMEOUT_MS);
+        if (args.inline || typeof file?.data !== "string") return file;
+        return saveAttachment(args.messageId, args.partName, file);
       }
       return { error: `Unknown operation: ${args.operation}` };
     },
@@ -537,12 +648,13 @@ export const tools = [
       }
       if (args.operation === "all") {
         const accounts = await api("GET", "/accounts");
-        const all = [];
-        for (const acct of accounts) {
-          const folders = await api("GET", `/accounts/${acct.id}/folders`);
-          for (const f of folders) all.push({ ...f, accountId: acct.id });
-        }
-        return all;
+        // Accounts in parallel; the extension bounds the per-folder work itself.
+        const perAccount = await Promise.all(
+          accounts.map((acct) => api("GET", `/accounts/${acct.id}/folders`, null, SEARCH_TIMEOUT_MS))
+        );
+        return perAccount.flatMap((folders, i) =>
+          folders.map((f) => ({ ...f, accountId: accounts[i].id }))
+        );
       }
       if (args.operation === "info") {
         if (!args.folderId) return { error: "folderId required for info" };

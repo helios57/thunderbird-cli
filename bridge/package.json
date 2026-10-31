@@ -8,6 +8,7 @@
   },
   "files": [
     "bridge.js",
+    "policy.js",
     "README.md"
   ],
   "scripts": {

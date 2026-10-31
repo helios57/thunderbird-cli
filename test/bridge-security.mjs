@@ -17,6 +17,8 @@ import { WebSocket } from "ws";
 const BRIDGE = join(dirname(fileURLToPath(import.meta.url)), "..", "bridge", "bridge.js");
 const PORT = 19720;
 const WS_PORT = 19721;
+// Never let a real ~/.config/thunderbird-cli/config.json (token, policy) leak into these tests.
+const NO_CONFIG = join(dirname(fileURLToPath(import.meta.url)), "__no_config__.json");
 const SELF_ORIGIN = `http://127.0.0.1:${PORT}`;
 
 let passed = 0, failed = 0;
@@ -36,7 +38,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function startBridge(env = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(process.execPath, [BRIDGE, "--port", String(PORT), "--ws-port", String(WS_PORT)], {
-      env: { ...process.env, TB_AUTH_TOKEN: undefined, ...env },
+      env: { ...process.env, TB_AUTH_TOKEN: undefined, TB_CONFIG_PATH: NO_CONFIG, ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -248,7 +250,7 @@ for (const [label, port] of [["WebSocket", WS_PORT], ["HTTP", PORT]]) {
   const blocker = createServer();
   await new Promise((r) => blocker.listen(port, "127.0.0.1", r));
   const proc = spawn(process.execPath, [BRIDGE, "--port", String(PORT), "--ws-port", String(WS_PORT)], {
-    env: { ...process.env, TB_AUTH_TOKEN: undefined },
+    env: { ...process.env, TB_AUTH_TOKEN: undefined, TB_CONFIG_PATH: NO_CONFIG },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let out = "";
@@ -257,7 +259,7 @@ for (const [label, port] of [["WebSocket", WS_PORT], ["HTTP", PORT]]) {
   const code = await new Promise((r) => proc.on("exit", r));
   await new Promise((r) => blocker.close(r));
   test(`${label} port taken → exit code 1`, code, 1);
-  test(`${label} port taken → explains and names the port`, out.includes(`Cannot listen on 127.0.0.1:${port}`) && out.includes(`lsof -nP -iTCP:${port}`), true);
+  test(`${label} port taken → explains and names the port`, out.includes(`Cannot listen on 127.0.0.1:${port}`) && (out.includes(`lsof -nP -iTCP:${port}`) || out.includes(`-LocalPort ${port}`)), true);
   test(`${label} port taken → no raw stack trace`, out.includes("Unhandled 'error' event"), false);
 }
 

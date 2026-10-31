@@ -14,6 +14,8 @@
     "test:mcp": "node test/mcp-test.mjs",
     "test:bridge-auth": "node test/bridge-auth.mjs",
     "test:bridge-security": "node test/bridge-security.mjs",
+    "test:bridge-policy": "node test/bridge-policy.mjs",
+    "test:all": "npm test && npm run test:mcp && npm run test:bridge-auth && npm run test:bridge-security && npm run test:bridge-policy && npm run test:extension",
     "test:extension": "node test/thread-utils.test.mjs && node test/extension.test.mjs",
     "bridge": "node bridge/bridge.js",
     "tb": "node cli/src/cli.js",

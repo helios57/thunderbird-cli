@@ -30,8 +30,10 @@ jobs:
           node -c cli/src/cli.js
           node -c cli/src/client.js
           node -c bridge/bridge.js
+          node -c bridge/policy.js
           node -c mcp/src/server.js
           node -c mcp/src/tools.js
+          node -c mcp/src/format.js
           node -c extension/src/background.js
           node -c extension/src/thread-utils.js
 
@@ -43,6 +45,9 @@ jobs:
 
       - name: Run bridge browser-origin tests (real bridge process)
         run: npm run test:bridge-security
+
+      - name: Run bridge access-policy tests (real bridge process)
+        run: npm run test:bridge-policy
 
       - name: Run extension background-script tests (mocked messenger API)
         run: npm run test:extension

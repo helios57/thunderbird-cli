@@ -30,7 +30,7 @@ function test(name, actual, expected) {
 
 /** Build a child env, treating an `undefined` value as "remove this variable". */
 function childEnv(overrides) {
-  const env = { ...process.env, ...overrides };
+  const env = { ...process.env, TB_CONFIG_PATH: join(dirname(fileURLToPath(import.meta.url)), "__no_config__.json"), ...overrides };
   for (const [k, v] of Object.entries(overrides)) {
     if (v === undefined) delete env[k];
   }

@@ -69,7 +69,8 @@ export const tools = [
     description:
       "Search emails across all accounts, newest first. Filters: sender, recipient, subject, date range, attachments, tags, size. Excludes junk by default. " +
       "Text matching (query, subject, from) is a CASE-SENSITIVE substring match — 'rechnung' does not find 'Rechnung'; try the spelling used in the mail, or search twice. " +
-      "On large mailboxes a text query is slowest without a date range: add since/until, accountId or folderId when you can. Use fields to cut tokens.",
+      "On large mailboxes a text query is slowest without a date range: add since/until, accountId or folderId when you can. Use fields to cut tokens. " +
+      "Copies of one mail in several folders of an account (Gmail labels, All Mail) are returned once, with the other folders in alsoIn.",
     inputSchema: {
       type: "object",
       properties: {
@@ -91,6 +92,7 @@ export const tools = [
         },
         offset: { type: "number", description: "Skip the first N results (pagination, newest order)" },
         fields: FIELDS_SCHEMA,
+        dedupe: { type: "boolean", description: "false = return every folder copy separately (default true)" },
         accountId: { type: "string", description: "Limit to specific account" },
         folderId: { type: "string", description: "Limit to specific folder" },
         from: { type: "string", description: "Filter by sender address" },
@@ -132,6 +134,7 @@ export const tools = [
       if (args.searchMode) body.searchMode = args.searchMode;
       if (args.offset) body.offset = args.offset;
       if (args.order === "any") body.sort = "none";
+      if (args.dedupe === false) body.dedupe = false;
       if (args.accountId) body.accountId = args.accountId;
       if (args.folderId) body.folderId = args.folderId;
       if (args.from) body.fromAddress = args.from;
@@ -171,6 +174,7 @@ export const tools = [
         accountId: { type: "string", description: "Limit to one account" },
         unread: { type: "boolean", description: "Unread only" },
         includeJunk: { type: "boolean", description: "Include junk (default false)" },
+        dedupe: { type: "boolean", description: "false = every folder copy separately (default true)" },
         limit: { type: "number", description: "Max results (default 50)" },
         fields: FIELDS_SCHEMA,
       },
@@ -180,6 +184,7 @@ export const tools = [
       if (args.accountId) body.accountId = args.accountId;
       if (args.unread) body.unreadOnly = true;
       if (args.includeJunk) body.includeJunk = true;
+      if (args.dedupe === false) body.dedupe = false;
       return shapeMessages(await api("POST", "/recent", body, SEARCH_TIMEOUT_MS), args.fields);
     },
   },

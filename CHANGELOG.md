@@ -32,6 +32,8 @@ Verified against the Thunderbird 159 WebExtension implementation (`ExtensionMess
 - New tools `email_recent` and `email_identities` (#30); tools carry MCP annotations (read-only / destructive).
 - Corrected tool descriptions: `fullText` is not an index (Thunderbird 159 parses bodies), and matching is case-sensitive.
 
+- **Gmail copies collapsed.** Gmail exposes one mail in INBOX, All Mail, Important and every label folder; search, `recent` and threads returned each copy (live: 12 hits = 4 mails). Copies within one account (same Message-ID) are now one result, represented by the inbox copy (then a real label, then All Mail), with the other folders in `alsoIn`; `limit` counts distinct mails. `dedupe: false` returns every copy. Extension 2.1.1.2.
+
 ### Fixed
 - Attached text files (`.txt`, `.csv`, `.ics`, attached `.html`) are listed as attachments instead of being merged into the body text.
 - `POST /messages/fetch` with an empty body no longer throws.

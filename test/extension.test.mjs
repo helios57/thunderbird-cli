@@ -383,6 +383,51 @@ test("tag and size filters go into the Thunderbird query", calls.query[0]?.tags?
 const fast = await handle("POST", "/messages/search", { subject: "Rechnung", limit: 2, sort: "none" });
 test("sort=none keeps the fast first-found path", fast.order === undefined && fast.messages.length === 2);
 
+// ─── Gmail copies ───────────────────────────────────────────────────
+
+console.log("\n\x1b[1mGmail copies\x1b[0m");
+// Gmail exposes one mail in INBOX, All Mail, Important and label folders (same Message-ID).
+const gfolder = (path, extra = {}) => ({ accountId: "acct1", path, name: path.split("/").pop(), ...extra });
+const copies = [];
+let cid = 300;
+const addMail = (hdr, ageDays, folders, accountId = "acct1") => {
+  for (const f of folders) {
+    copies.push(header(cid++, { headerMessageId: hdr, date: new Date(Date.now() - ageDays * DAY), subject: "eBill", folder: { ...f, accountId } }));
+  }
+};
+addMail("a@x", 1, [gfolder("/[Gmail]/Alle Nachrichten", { specialUse: ["all"] }), gfolder("/INBOX", { specialUse: ["inbox"] }), gfolder("/[Gmail]/Wichtig")]);
+addMail("b@x", 2, [gfolder("/[Gmail]/Alle Nachrichten", { specialUse: ["all"] }), gfolder("/Rechnungen")]);
+addMail("c@x", 3, [gfolder("/INBOX", { specialUse: ["inbox"] })]);
+addMail("a@x", 1, [gfolder("/INBOX", { specialUse: ["inbox"] })], "acct2"); // same mail, other mailbox
+queryHandlers.length = 0;
+queryHandlers.push((q) => pageOf(copies.filter((h) =>
+  (!q.fromDate || h.date >= q.fromDate) && (!q.toDate || h.date <= q.toDate) && (!q.subject || h.subject.includes(q.subject))), 0));
+
+const deduped = await handle("POST", "/messages/search", { subject: "eBill", limit: 3 });
+const mailA = deduped.messages.find((m) => m.headerMessageId === "a@x" && m.folder.accountId === "acct1");
+test("copies of one mail collapse to one result", deduped.messages.filter((m) => m.headerMessageId === "a@x" && m.folder.accountId === "acct1").length === 1);
+test("the inbox copy represents the mail", mailA?.folder.path === "/INBOX");
+test("other folders are listed in alsoIn", JSON.stringify(mailA?.alsoIn?.sort()) === JSON.stringify(["/[Gmail]/Alle Nachrichten", "/[Gmail]/Wichtig"]));
+test("a real label folder beats All Mail", deduped.messages.find((m) => m.headerMessageId === "b@x")?.folder.path === "/Rechnungen");
+test("limit counts distinct mails", deduped.messages.length === 3 && new Set(deduped.messages.map((m) => `${m.folder.accountId}|${m.headerMessageId}`)).size === 3);
+test("the same mail in another account stays separate", deduped.messages.some((m) => m.folder.accountId === "acct2"));
+const raw2 = await handle("POST", "/messages/search", { subject: "eBill", limit: 20, dedupe: false });
+test("dedupe:false returns every copy", raw2.messages.length === copies.length);
+const recentDedup = await handle("POST", "/recent", { hours: 24 * 30, limit: 50 });
+test("recent collapses copies too", recentDedup.messages.length === 4, `got ${recentDedup.messages.length}`);
+
+// Thread: references query returns every copy of each referenced mail.
+store.clear();
+for (const h of copies) store.set(h.id, { header: h });
+store.set(399, { header: header(399, { subject: "Re: eBill", headerMessageId: "reply@x", folder: gfolder("/INBOX", { specialUse: ["inbox"] }) }),
+  raw: "Message-ID: <reply@x>\r\nReferences: <a@x>\r\nSubject: Re: eBill\r\n\r\nbody" });
+queryHandlers.length = 0;
+queryHandlers.push((q) => q.headerMessageId && { messages: [...store.values()].map((s) => s.header).filter((h) => h.headerMessageId === q.headerMessageId && h.folder.accountId === "acct1") });
+queryHandlers.push((q) => q.subject && { messages: [] });
+const gThread = await handle("GET", "/messages/399/thread");
+test("thread lists each mail once", gThread.count === 2 && gThread.thread.filter((m) => m.headerMessageId === "a@x").length === 1, JSON.stringify(gThread.thread.map((m) => m.id)));
+test("thread keeps the references match label", gThread.thread.every((m) => m.threadMatch === "references"));
+
 // ─── Body parts ─────────────────────────────────────────────────────
 
 console.log("\n\x1b[1mBody parts\x1b[0m");

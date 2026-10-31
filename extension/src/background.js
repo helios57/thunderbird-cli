@@ -215,7 +215,8 @@ async function handleRequest({ method, path, body }) {
     const { query, accountId, fromAddress, toAddress, subject,
             unreadOnly, flagged, limit = 25, offset = 0, fromDate, toDate,
             folderId, tag, hasAttachment, sizeMin, sizeMax,
-            includeJunk, headerMessageId, searchMode = "fulltext", sort = "date" } = body || {};
+            includeJunk, headerMessageId, searchMode = "fulltext", sort = "date",
+            dedupe = true } = body || {};
     const q = {};
     // Thunderbird has no index behind messages.query: fullText matches subject/author and
     // otherwise parses each candidate's MIME body, body always parses it. Both are
@@ -256,7 +257,7 @@ async function handleRequest({ method, path, body }) {
       if (headerMessageId || sort === "none") {
         return collectMessages(() => runQuery(q), limit, { offset, keep });
       }
-      return collectNewestPage(q, limit, offset, keep);
+      return collectNewestPage(q, limit, offset, keep, { dedupe: dedupe !== false });
     };
 
     let result;
@@ -510,12 +511,14 @@ async function handleRequest({ method, path, body }) {
     // messages.query() matches headerMessageId without angle brackets
     if (msg?.headerMessageId) ids.add(stripAngleBrackets(msg.headerMessageId));
 
-    const seen = new Set();
-    const thread = [];
+    // Copies of one mail (Gmail labels, All Mail) collapse into one thread entry; a match via
+    // References outranks the subject heuristic.
+    const dedupe = body?.dedupe !== false;
+    const found = new Map();
+    const how = new Map();
     const add = (m, threadMatch) => {
-      if (seen.has(m.id)) return;
-      seen.add(m.id);
-      thread.push({ ...formatMessage(m), threadMatch });
+      const key = addCopy(found, m, dedupe);
+      if (how.get(key) !== "references") how.set(key, threadMatch);
     };
 
     // Upstream: every message named in References / In-Reply-To
@@ -541,6 +544,7 @@ async function handleRequest({ method, path, body }) {
       } catch {}
     }
 
+    const thread = [...found].map(([key, entry]) => ({ ...formatCopies(entry), threadMatch: how.get(key) }));
     thread.sort((a, b) => new Date(a.date) - new Date(b.date));
     return { thread, count: thread.length };
   }
@@ -671,7 +675,8 @@ async function handleRequest({ method, path, body }) {
   // ─── Recent ─────────────────────────────────────────────────────
 
   if (path === "/recent" && method === "POST") {
-    const { hours = 24, limit = 50, accountId, unreadOnly = false, includeJunk = false } = body || {};
+    const { hours = 24, limit = 50, accountId, unreadOnly = false, includeJunk = false,
+            dedupe = true } = body || {};
     const since = new Date(Date.now() - hours * 60 * 60 * 1000);
     // Filters go into the query so Thunderbird skips non-matching headers itself; the page
     // is the true newest `limit` (previously: the first `limit` found, then sorted).
@@ -681,7 +686,7 @@ async function handleRequest({ method, path, body }) {
     if (!includeJunk) q.junk = false;
     const keep = (msg) =>
       (!unreadOnly || !msg.read) && (!accountId || msg.folder?.accountId === accountId);
-    const result = await collectNewestPage(q, limit, 0, keep);
+    const result = await collectNewestPage(q, limit, 0, keep, { dedupe: dedupe !== false });
     result.since = since.toISOString();
     return result;
   }
@@ -919,7 +924,7 @@ async function collectMessages(queryFn, limit,
  * most four passes, and because Thunderbird checks dates before parsing bodies, text searches
  * only parse messages inside the slices actually visited.
  */
-async function collectNewestPage(q, limit, offset = 0, keep = null) {
+async function collectNewestPage(q, limit, offset = 0, keep = null, { dedupe = true } = {}) {
   const needed = offset + limit;
   const upper = q.toDate ? q.toDate.getTime() : Infinity;
   const lower = q.fromDate ? q.fromDate.getTime() : -Infinity;
@@ -927,6 +932,7 @@ async function collectNewestPage(q, limit, offset = 0, keep = null) {
   const cuts = NEWEST_SLICES_DAYS.map((d) => now - d * DAY_MS).filter((t) => t > lower && t < upper);
   cuts.push(lower);
 
+  // Unique messages (copies collapsed, see addCopy), so `limit` counts distinct mails.
   const found = new Map();
   let end = upper;
   let truncated = false;
@@ -942,7 +948,7 @@ async function collectNewestPage(q, limit, offset = 0, keep = null) {
     slices++;
     while (page) {
       for (const msg of page.messages) {
-        if (!keep || keep(msg)) found.set(msg.id, msg); // slice bounds are inclusive: dedupe
+        if (!keep || keep(msg)) addCopy(found, msg, dedupe);
       }
       if (!page.id) break;
       if (found.size >= MAX_NEWEST_SCAN) {
@@ -960,8 +966,8 @@ async function collectNewestPage(q, limit, offset = 0, keep = null) {
     }
   }
 
-  const sorted = [...found.values()].sort((a, b) => b.date - a.date);
-  const messages = sorted.slice(offset, needed).map(formatMessage);
+  const sorted = [...found.values()].sort((a, b) => b.best.date - a.best.date);
+  const messages = sorted.slice(offset, needed).map(formatCopies);
   return {
     messages, total: messages.length, offset,
     hasMore: sorted.length > needed || !exhausted,
@@ -969,6 +975,50 @@ async function collectNewestPage(q, limit, offset = 0, keep = null) {
     slicesScanned: slices,
     ...(truncated ? { truncated: true, note: `More than ${MAX_NEWEST_SCAN} hits in one date range; narrow the search (date, account, folder) for exact newest-first order.` } : {}),
   };
+}
+
+/**
+ * Which copy of a message represents it: lower is better. Gmail (and other label-based IMAP
+ * servers) expose one mail in INBOX, "[Gmail]/All Mail", "[Gmail]/Important" and every label
+ * folder; the inbox copy is the one an agent should read and act on (archiving it removes the
+ * inbox label), then a real folder/label, then Gmail's virtual folders.
+ */
+function copyRank(msg) {
+  const f = msg.folder || {};
+  const use = [...(f.specialUse || []), ...(f.type ? [f.type] : [])];
+  if (use.includes("inbox")) return 0;
+  if (use.includes("sent") || use.includes("drafts")) return 1;
+  if (use.includes("trash") || use.includes("junk")) return 5;
+  if (use.includes("all") || use.includes("archives")) return 4;
+  if (/^\/\[(gmail|google mail)\]\//i.test(f.path || "")) return 3;
+  return 2;
+}
+
+/**
+ * Add a header to a Map of unique messages, collapsing copies of the same mail within one
+ * account (same Message-ID). Copies in different accounts stay separate: "sent by Luc" and
+ * "received by Mirella" are different facts. Same id twice (inclusive slice bounds) is ignored.
+ * Returns the message's key in `found`.
+ */
+function addCopy(found, msg, dedupe = true) {
+  const hdr = dedupe && msg.headerMessageId ? stripAngleBrackets(msg.headerMessageId) : null;
+  const key = hdr ? `${msg.folder?.accountId || ""}|${hdr}` : `id:${msg.id}`;
+  const entry = found.get(key);
+  if (!entry) {
+    found.set(key, { best: msg, copies: [msg] });
+  } else if (!entry.copies.some((c) => c.id === msg.id)) {
+    entry.copies.push(msg);
+    if (copyRank(msg) < copyRank(entry.best)) entry.best = msg;
+  }
+  return key;
+}
+
+/** formatMessage() of the representative copy, plus the other folders it sits in. */
+function formatCopies(entry) {
+  const out = formatMessage(entry.best);
+  const others = entry.copies.filter((c) => c !== entry.best).map((c) => c.folder?.path).filter(Boolean);
+  if (others.length) out.alsoIn = [...new Set(others)];
+  return out;
 }
 
 function filterBulkMessages(messages, filters) {

@@ -55,7 +55,7 @@ function header(id, extra = {}) {
   };
 }
 
-const calls = { query: [], getRaw: [], update: [], list: [], abortList: [] };
+const calls = { query: [], getRaw: [], update: [], list: [], abortList: [], move: [], delete: [], compose: [] };
 let legacyList = false;
 let listSeq = 0;
 let onAbort = null;
@@ -78,8 +78,63 @@ function pageOf(all, start) {
 }
 const queryHandlers = [];
 
+// Compose windows: tab id → { kind, relatedId, details, attachments, saved, sent, closed }.
+const composeTabs = new Map();
+let nextTabId = 100;
+let nextAttachmentId = 1;
+let nextDraftId = 900;
+let failAddAttachment = false;
+const begin = (kind) => async (relatedId, ...rest) => {
+  const details = rest.at(-1) || {};
+  const id = nextTabId++;
+  const tab = { kind, relatedId, details, attachments: [], closed: false };
+  // "Edit as new" carries the draft's attachments over.
+  if (kind === "new" && relatedId != null) {
+    for (const name of store.get(relatedId)?.attachmentNames || []) tab.attachments.push({ id: nextAttachmentId++, name, size: 1 });
+  }
+  composeTabs.set(id, tab);
+  calls.compose.push({ kind, relatedId, details, id });
+  return { id };
+};
+const trashFolder = (accountId) => ({ id: `${accountId}://Trash`, accountId, path: "/Trash", name: "Trash", specialUse: ["trash"], type: "trash" });
+const draftsFolder = (accountId = "acct1") => ({ accountId, path: "/Drafts", name: "Drafts", specialUse: ["drafts"], type: "drafts" });
+
 const messenger = {
   runtime: { getManifest: () => manifest },
+  accounts: {
+    get: async (id) => (id === "noTrash"
+      ? { id, rootFolder: { id: "r", subFolders: [{ id: "i", name: "Inbox", specialUse: ["inbox"], subFolders: [] }] } }
+      : { id, rootFolder: { id: `${id}://`, subFolders: [
+          { id: `${id}://INBOX`, name: "Inbox", specialUse: ["inbox"], subFolders: [] },
+          { id: `${id}://[Gmail]`, name: "[Gmail]", subFolders: [trashFolder(id)] },
+        ] } }),
+  },
+  compose: {
+    beginNew: begin("new"),
+    beginReply: begin("reply"),
+    beginForward: begin("forward"),
+    addAttachment: async (tabId, { file, name }) => {
+      if (failAddAttachment) throw new Error("attach failed");
+      const a = { id: nextAttachmentId++, name: name || file.name, size: file.size, file };
+      composeTabs.get(tabId).attachments.push(a);
+      return { id: a.id, name: a.name, size: a.size };
+    },
+    listAttachments: async (tabId) => composeTabs.get(tabId).attachments.map(({ id, name, size }) => ({ id, name, size })),
+    removeAttachment: async (tabId, attachmentId) => {
+      const t = composeTabs.get(tabId);
+      t.attachments = t.attachments.filter((a) => a.id !== attachmentId);
+    },
+    setComposeDetails: async (tabId, d) => { composeTabs.get(tabId).discarded = d.isModified === false; },
+    saveMessage: async (tabId) => {
+      const t = composeTabs.get(tabId);
+      t.saved = true;
+      const id = nextDraftId++;
+      store.set(id, { header: header(id, { folder: draftsFolder() }), attachmentNames: t.attachments.map((a) => a.name) });
+      return { mode: "draft", messages: [{ id }] };
+    },
+    sendMessage: async (tabId) => { composeTabs.get(tabId).sent = true; composeTabs.get(tabId).closed = true; return { mode: "sendNow", messages: [] }; },
+  },
+  tabs: { remove: async (tabId) => { composeTabs.get(tabId).closed = true; } },
   idle: { onStateChanged: { addListener: (fn) => idleListeners.push(fn) } },
   folders: { get: async (id) => ({ id, accountId: "acct1" }) },
   messages: {
@@ -131,6 +186,14 @@ const messenger = {
     // Thunderbird's abortList() resolves the pending page with what was found so far.
     abortList: async (id) => { calls.abortList.push(id); pages.delete(id); onAbort?.(id); },
     update: (id, props) => track(async () => { calls.update.push({ id, props }); }),
+    move: async (ids, folder) => {
+      calls.move.push({ ids, folder });
+      for (const id of ids) {
+        const s = store.get(id);
+        if (s) s.header = { ...s.header, folder };
+      }
+    },
+    delete: async (ids, permanent) => { calls.delete.push({ ids, permanent }); for (const id of ids) store.delete(id); },
     getAttachmentFile: async () => {
       const bytes = randomBytes(100_000);
       attachmentBytes = bytes;
@@ -145,6 +208,8 @@ const ctx = vm.createContext({
   WebSocket: MockWebSocket,
   messenger,
   btoa,
+  atob,
+  File,
   setTimeout: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; },
   clearTimeout: (t) => { if (t) t.cleared = true; },
 });
@@ -535,6 +600,150 @@ test("an attached text file is listed as an attachment", withFiles.parts.attachm
 console.log("\n\x1b[1mAttachment\x1b[0m");
 const att = await handle("POST", "/messages/1/attachment", { partName: "1.2" });
 test("chunked base64 matches Node's encoder (100 KB, multi-chunk)", att.data === attachmentBytes.toString("base64"));
+
+// ─── Delete ─────────────────────────────────────────────────────────
+
+console.log("\n\x1b[1mDelete\x1b[0m");
+store.clear();
+const inbox = { accountId: "acct1", path: "/INBOX", name: "Inbox", specialUse: ["inbox"], type: "inbox" };
+store.set(301, { header: header(301, { folder: inbox }) });
+store.set(302, { header: header(302, { folder: draftsFolder() }) });
+store.set(303, { header: header(303, { folder: draftsFolder("acct2") }) });
+store.set(304, { header: header(304, { folder: trashFolder("acct1") }) });
+store.set(305, { header: header(305, { folder: { accountId: "noTrash", path: "/Inbox", name: "Inbox" } }) });
+calls.move.length = 0; calls.delete.length = 0;
+
+const trashed = await handle("POST", "/messages/trash", { messageIds: [301, 302] });
+test("delete moves to the account's Trash folder", trashed.deleted === 2 && calls.move.length === 1 &&
+  calls.move[0].folder.id === "acct1://Trash" && JSON.stringify(calls.move[0].ids) === "[301,302]", JSON.stringify(calls.move));
+test("delete to trash never calls messages.delete", calls.delete.length === 0);
+
+store.get(301).header.folder = inbox;
+store.get(302).header.folder = draftsFolder();
+calls.move.length = 0;
+const draftsOnly = await handle("POST", "/messages/trash", { messageIds: [301, 302, 303], draftsOnly: true });
+test("draftsOnly moves only drafts", draftsOnly.deleted === 2 && calls.move.flatMap((m) => m.ids).sort().join() === "302,303", JSON.stringify(calls.move));
+test("draftsOnly reports the others untouched", JSON.stringify(draftsOnly.notDrafts) === "[301]" && store.get(301).header.folder === inbox);
+test("drafts go to the trash of their own account", calls.move.find((m) => m.ids.includes(303))?.folder.id === "acct2://Trash");
+
+calls.move.length = 0;
+const inTrash = await handle("POST", "/messages/trash", { messageIds: [304] });
+test("messages already in Trash stay (removing them would be permanent)", inTrash.deleted === 0 &&
+  JSON.stringify(inTrash.alreadyInTrash) === "[304]" && calls.move.length === 0 && calls.delete.length === 0);
+
+let noTrashErr = null;
+try { await handle("POST", "/messages/trash", { messageIds: [301, 305] }); } catch (e) { noTrashErr = e; }
+test("an account without Trash fails the request before anything moves", /no Trash folder/.test(noTrashErr?.message) && calls.move.length === 0, noTrashErr?.message);
+
+let missingDel = null;
+try { await handle("POST", "/messages/trash", { messageIds: [301, 9999] }); } catch (e) { missingDel = e; }
+test("an unknown id fails the request before anything moves", !!missingDel && calls.move.length === 0);
+
+const perm = await handle("POST", "/messages/delete", { messageIds: [301], permanent: true });
+test("permanent delete uses messages.delete(ids, true)", perm.permanent === true && calls.delete.length === 1 && calls.delete[0].permanent === true);
+test("delete without ids is an error", !!(await handle("POST", "/messages/trash", { messageIds: [] })).error);
+store.set(306, { header: header(306, { folder: inbox }) });
+calls.delete.length = 0; calls.move.length = 0;
+const legacyDel = await handle("POST", "/messages/delete", { messageIds: [306] });
+test("/messages/delete without permanent also moves to the trash", legacyDel.movedTo === "trash" && calls.move.length === 1 && calls.delete.length === 0);
+
+// ─── Compose with attachments ───────────────────────────────────────
+
+console.log("\n\x1b[1mCompose with attachments\x1b[0m");
+const pdf = { name: "Rechnung.pdf", data: Buffer.from("%PDF-1.4 test").toString("base64") };
+const odd = { name: "notes.weird", data: Buffer.from("x").toString("base64") };
+const composed = await handle("POST", "/compose", { to: "a@b.c", subject: "S", body: "B", attachments: [pdf, odd] });
+const ctab = composeTabs.get(calls.compose.at(-1).id);
+test("compose saves a draft and returns its id", composed.action === "draft_saved" && typeof composed.draftId === "number" && ctab.saved && ctab.closed);
+test("compose attaches each file", composed.attachments?.length === 2 && ctab.attachments.map((a) => a.name).join() === "Rechnung.pdf,notes.weird");
+test("attachment bytes arrive intact", Buffer.from(await ctab.attachments[0].file.arrayBuffer()).toString() === "%PDF-1.4 test");
+test("content type is guessed from the name", ctab.attachments[0].file.type === "application/pdf" && ctab.attachments[1].file.type === "");
+
+const before = composeTabs.size;
+let badB64 = null;
+try { await handle("POST", "/compose", { to: "a@b.c", attachments: [{ name: "x.pdf", data: "!!!" }] }); } catch (e) { badB64 = e; }
+test("invalid base64 fails before a compose window opens", /not valid base64/.test(badB64?.message) && composeTabs.size === before, badB64?.message);
+let noName = null;
+try { await handle("POST", "/reply", { messageId: 1, attachments: [{ data: "eA==" }] }); } catch (e) { noName = e; }
+test("an attachment without a name is rejected", /needs a name/.test(noName?.message) && composeTabs.size === before);
+
+failAddAttachment = true;
+let attachErr = null;
+try { await handle("POST", "/compose", { to: "a@b.c", attachments: [pdf] }); } catch (e) { attachErr = e; }
+failAddAttachment = false;
+const failedTab = composeTabs.get(calls.compose.at(-1).id);
+test("a failed attachment closes the window unsaved", !!attachErr && failedTab.closed && failedTab.discarded && !failedTab.saved);
+
+const replied = await handle("POST", "/reply", { messageId: 1, body: "Danke", attachments: [pdf] });
+const rtab = composeTabs.get(calls.compose.at(-1).id);
+test("reply carries attachments", replied.action === "draft_saved" && rtab.kind === "reply" && rtab.attachments.length === 1);
+const forwarded = await handle("POST", "/forward", { messageId: 1, to: "c@d.e", attachments: [pdf], open: true });
+const ftab = composeTabs.get(calls.compose.at(-1).id);
+test("forward opened for the human keeps the window open", forwarded.action === "draft_opened" && !ftab.closed && ftab.attachments.length === 1);
+const sentMail = await handle("POST", "/compose", { to: "a@b.c", body: "x", attachments: [pdf], send: true });
+test("send with attachments", sentMail.action === "sent" && composeTabs.get(calls.compose.at(-1).id).sent);
+const plain = await handle("POST", "/compose", { to: "a@b.c", body: "x" });
+test("compose without attachments is unchanged", plain.action === "draft_saved" && plain.attachments === undefined);
+
+// ─── Edit draft ─────────────────────────────────────────────────────
+
+console.log("\n\x1b[1mEdit draft\x1b[0m");
+store.set(310, { header: header(310, { folder: draftsFolder() }), attachmentNames: ["alt.pdf", "bild.png"] });
+calls.move.length = 0;
+const edited = await handle("POST", "/drafts/update", { draftId: 310, attachments: [pdf], removeAttachments: ["alt.pdf"], subject: "Neu" });
+const etab = composeTabs.get(calls.compose.at(-1).id);
+test("draft is opened as a copy of itself", etab.kind === "new" && etab.relatedId === 310 && etab.details.subject === "Neu");
+test("only the given fields are changed", !("to" in etab.details) && !("body" in etab.details) && !("plainTextBody" in etab.details));
+test("attachments are removed and added", etab.attachments.map((a) => a.name).join() === "bild.png,Rechnung.pdf", etab.attachments.map((a) => a.name).join());
+test("the result lists every attachment the draft now has", edited.attachments?.map((a) => a.name).join() === "bild.png,Rechnung.pdf", JSON.stringify(edited.attachments));
+test("a plain-text draft stays plain text", etab.details.isPlainText === true, etab.details.isPlainText);
+test("edited draft is saved with a new id", edited.action === "draft_saved" && edited.draftId !== 310 && edited.replacedDraftId === 310);
+test("the original draft goes to the trash", edited.originalDraftDeleted === true && calls.move.some((m) => m.ids.includes(310) && m.folder.id === "acct1://Trash"));
+
+store.set(311, { header: header(311, { folder: draftsFolder() }), attachmentNames: ["a.pdf"] });
+await handle("POST", "/drafts/update", { draftId: 311, body: "Zeile 1\n<b>2</b>" });
+const btab = composeTabs.get(calls.compose.at(-1).id);
+test("a new body is given in both formats", btab.details.plainTextBody === "Zeile 1\n<b>2</b>" && btab.details.body === "Zeile 1<br>&lt;b&gt;2&lt;/b&gt;");
+
+store.set(312, { header: header(312, { folder: draftsFolder() }), attachmentNames: ["a.pdf"] });
+calls.move.length = 0;
+let missingAtt = null;
+try { await handle("POST", "/drafts/update", { draftId: 312, removeAttachments: ["b.pdf"] }); } catch (e) { missingAtt = e; }
+const mtab = composeTabs.get(calls.compose.at(-1).id);
+test("removing an attachment the draft lacks changes nothing", /no attachment named "b.pdf".*it has: "a.pdf"/.test(missingAtt?.message) &&
+  mtab.closed && !mtab.saved && calls.move.length === 0 && store.get(312).header.folder.path === "/Drafts", missingAtt?.message);
+
+store.set(313, { header: header(313, { folder: inbox }) });
+const tabsBefore = composeTabs.size;
+let notDraft = null;
+try { await handle("POST", "/drafts/update", { draftId: 313, attachments: [pdf] }); } catch (e) { notDraft = e; }
+test("only drafts can be edited", /not in a Drafts folder/.test(notDraft?.message) && composeTabs.size === tabsBefore);
+
+store.set(314, { header: header(314, { folder: draftsFolder() }) });
+calls.move.length = 0;
+const openedEdit = await handle("POST", "/drafts/update", { draftId: 314, attachments: [pdf], open: true });
+test("editing a draft for the human keeps the original", openedEdit.action === "draft_opened" && calls.move.length === 0 && /original draft stays/.test(openedEdit.note));
+
+const htmlFull = { contentType: "multipart/alternative", headers: {}, parts: [
+  { contentType: "text/plain", body: "Hallo", partName: "1.1", headers: {} },
+  { contentType: "text/html", body: "<p>Hallo</p>", partName: "1.2", headers: {} },
+] };
+store.set(315, { header: header(315, { folder: draftsFolder() }), full: htmlFull });
+await handle("POST", "/drafts/update", { draftId: 315, subject: "x" });
+test("an HTML draft stays HTML", composeTabs.get(calls.compose.at(-1).id).details.isPlainText === false);
+
+store.set(316, { header: header(316, { folder: draftsFolder() }) });
+await handle("POST", "/drafts/update", { draftId: 316, body: "<b>neu</b>", isHTML: true });
+const htab = composeTabs.get(calls.compose.at(-1).id);
+test("an explicit HTML body makes a plain draft HTML", htab.details.isPlainText === false && htab.details.body === "<b>neu</b>");
+
+store.set(317, { header: header(317, { folder: draftsFolder() }), get full() { throw new Error("offline"); } });
+await handle("POST", "/drafts/update", { draftId: 317, subject: "x" });
+test("an unreadable draft body leaves the format to Thunderbird", !("isPlainText" in composeTabs.get(calls.compose.at(-1).id).details));
+
+store.set(318, { header: header(318, { folder: draftsFolder() }), attachmentNames: ["a.pdf"] });
+const stripped = await handle("POST", "/drafts/update", { draftId: 318, removeAttachments: ["a.pdf"] });
+test("removing the last attachment reports an empty list", Array.isArray(stripped.attachments) && stripped.attachments.length === 0, JSON.stringify(stripped.attachments));
 
 console.log(`\n\x1b[1m${"─".repeat(40)}\x1b[0m`);
 console.log(`\x1b[1m${passed} passed, ${failed} failed, ${passed + failed} total\x1b[0m\n`);

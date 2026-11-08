@@ -32,7 +32,7 @@ tb mark <messageId> --read
 tb mark <id1,id2,id3> --flagged      # batch mark
 tb move <messageId> <folderId>
 tb archive <messageId>
-tb delete <messageId>
+tb delete <messageId>                 # to the account's Trash (drafts too)
 
 # Tags
 tb tag <messageId> $label1            # add tag
@@ -45,6 +45,8 @@ tb reply <messageId> --body "text" --send     # send immediately
 tb compose --to "a@b.com" --subject "Hi" --body "Hello"
 tb compose --to "a@b.com" --body "Hi" --send  # send immediately
 tb forward <messageId> --to "c@d.com"
+tb compose --to "a@b.com" --body "Anbei" --attach ./offerte.pdf   # attach files (repeatable)
+tb draft-edit <draftId> --attach ./b.pdf --remove-attachment a.pdf # edit a saved draft
 
 # Attachments
 tb attachments <messageId>
@@ -93,6 +95,7 @@ tb stats --compact                               # strip nulls
 - **Folder IDs** look like `account1://INBOX` — get via `tb folders <accountId>`
 - **Identity IDs** look like `id1` — get via `tb identities`, use with `--from`
 - **Compose defaults to draft** — use `--send` to send immediately, `--open` to open in Thunderbird
+- **Delete moves to the Trash** (recoverable); drafts can be deleted at bridge policy `draft`, other mail needs `organize`
 - **Destructive operations** (`delete --permanent`, `folder-delete`, `bulk delete`) require `--confirm`
 - **Search excludes junk** by default — use `--include-junk` to override
 - **Relative dates** work in `--since`/`--until`: `7d`, `2w`, `3m`, `1y`, `today`, `yesterday`

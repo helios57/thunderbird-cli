@@ -3,8 +3,9 @@
 > Give Claude (and other AI agents) full access to your email through Mozilla Thunderbird.
 
 > **Fork notes (`helios57/thunderbird-cli`).** Based on upstream 1.1.1 (PR #26), plus: a bridge
-> **access policy** (`read` / `draft` / `organize` / `full`, default `draft` — never sends or
-> deletes), token and policy from the shared config file, **newest-first search that stays fast on
+> **access policy** (`read` / `draft` / `organize` / `full`, default `draft` — never sends, and
+> only drafts can be deleted), token and policy from the shared config file, **attach local files
+> and edit saved drafts**, delete as a recoverable move to the Trash, **newest-first search that stays fast on
 > large multi-account mailboxes**, native sorted folder listing, attachments saved to disk instead of
 > base64, HTML mails as text, compact MCP output, and a Windows setup for Claude Code.
 > See [CHANGELOG](CHANGELOG.md) and the German guide [docs/ANLEITUNG-WINDOWS.md](docs/ANLEITUNG-WINDOWS.md).
@@ -29,7 +30,7 @@ Tested at scale: **22 accounts, 249,000+ messages, 86,000+ unread** — all mana
 
 - 🔐 **Zero credential exposure** — all IMAP/SMTP stays in Thunderbird
 - 🤖 **Claude Desktop ready** — 12 MCP tools, one-line config
-- 📨 **38 CLI commands** — read, search, compose, reply, bulk ops, folder CRUD, attachments
+- 📨 **39 CLI commands** — read, search, compose, reply, bulk ops, folder CRUD, attachments
 - 🛡️ **Safe by default** — compose/reply/forward save as drafts; permanent delete requires `--confirm`
 - 🎯 **Token-optimized** — `--fields` selection, `--compact` mode, `--max-body` truncation
 - 🏠 **Localhost-only** — no cloud, no telemetry, nothing leaves your machine
@@ -129,7 +130,7 @@ Without the skill, the MCP still works. With it, Claude automatically uses the s
 |---|---|
 | **Extension** (`extension/`) | Thunderbird WebExtension. Calls `messenger.*` APIs. 43 route handlers. |
 | **Bridge** (`bridge/`) | Stateless HTTP↔WebSocket proxy daemon. No business logic. |
-| **CLI** (`cli/`) | `tb` command — 38 commands. Thin HTTP client. JSON output. |
+| **CLI** (`cli/`) | `tb` command — 39 commands. Thin HTTP client. JSON output. |
 | **MCP** (`mcp/`) | `tb-mcp` server — 12 curated tools for Claude Desktop. |
 
 Thunderbird is the source of truth. The CLI never caches or stores email data.
@@ -152,7 +153,7 @@ The niche: **you already trust Thunderbird with your credentials and account sta
 | Doc | What's inside |
 |---|---|
 | [docs/SETUP.md](docs/SETUP.md) | Installation, background service, Docker, troubleshooting |
-| [docs/COMMANDS.md](docs/COMMANDS.md) | Full reference for all 38 CLI commands |
+| [docs/COMMANDS.md](docs/COMMANDS.md) | Full reference for all 39 CLI commands |
 | [docs/CLAUDE.md](docs/CLAUDE.md) | AI-agent-focused quick reference + security rules |
 | [skills/thunderbird-cli/SKILL.md](skills/thunderbird-cli/SKILL.md) | **Companion Claude Skill** — recipes, safety defaults, token patterns |
 | [mcp/README.md](mcp/README.md) | Claude Desktop integration guide |

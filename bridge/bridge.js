@@ -22,9 +22,10 @@
  *   TB_BRIDGE_WS_TAKEOVER_MS  how long a connected extension has to answer a ping before a new
  *                             connection may replace it (default: 2000)
  *   TB_BRIDGE_POLICY          what callers may do: read | draft | organize | full (default: draft,
- *                             i.e. read everything and save drafts, but never send or delete).
- *                             See policy.js.
- *   TB_BRIDGE_MAX_BODY_BYTES  largest accepted request body (default: 10485760 = 10 MiB)
+ *                             i.e. read everything, save and edit drafts and move drafts to the
+ *                             trash, but never send or delete other mail). See policy.js.
+ *   TB_BRIDGE_MAX_BODY_BYTES  largest accepted request body (default: 33554432 = 32 MiB; uploaded
+ *                             attachments travel base64-encoded, ~4/3 of their size)
  *   TB_CONFIG_PATH            config file to read instead of ~/.config/thunderbird-cli/config.json
  *
  * The config file shared with tb / tb-mcp may hold `bridge.authToken` and `bridge.policy`, so
@@ -47,7 +48,7 @@ const WS_PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--ws-port"
 const DEFAULT_TIMEOUT = parseInt(process.env.TB_BRIDGE_TIMEOUT || "120000");
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.TB_BRIDGE_WS_HEARTBEAT_MS || "30000");
 const TAKEOVER_PROBE_MS = parseInt(process.env.TB_BRIDGE_WS_TAKEOVER_MS || "2000");
-const MAX_BODY_BYTES = parseInt(process.env.TB_BRIDGE_MAX_BODY_BYTES || String(10 * 1024 * 1024));
+const MAX_BODY_BYTES = parseInt(process.env.TB_BRIDGE_MAX_BODY_BYTES || String(32 * 1024 * 1024));
 
 function loadFileConfig() {
   const paths = process.env.TB_CONFIG_PATH
@@ -472,7 +473,7 @@ httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
   );
   console.log(
     `[bridge] Policy: ${POLICY}` +
-      (POLICY === "full" ? " — callers may send mail and delete messages" : " (raise with TB_BRIDGE_POLICY / bridge.policy)")
+      (POLICY === "full" ? " — callers may send mail and delete messages permanently" : " (raise with TB_BRIDGE_POLICY / bridge.policy)")
   );
   if (FILE_CONFIG.path) console.log(`[bridge] Config: ${FILE_CONFIG.path}`);
   console.log(`[bridge] Waiting for Thunderbird extension to connect...`);

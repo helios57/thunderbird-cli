@@ -9,7 +9,7 @@
 
 import { createRequire } from "module";
 import { Command } from "commander";
-import { api, output, outputError, getConfig, parseRelativeDate } from "./client.js";
+import { api, output, outputError, getConfig, parseRelativeDate, readAttachmentFiles } from "./client.js";
 
 const { version } = createRequire(import.meta.url)("../package.json");
 
@@ -51,6 +51,30 @@ function run(fn) {
 
 function parseIds(str) {
   return str.split(",").map(id => parseInt(id.trim()));
+}
+
+// Repeatable option: --attach a.pdf --attach b.png
+const collect = (value, previous) => [...previous, value];
+
+// Saving a draft with attachments to IMAP can take longer than the default timeout.
+function composeTimeout(globalOpts, payload) {
+  const t = getTimeout(globalOpts);
+  return payload.attachments?.length || payload.draftId != null ? Math.max(t, 120000) : t;
+}
+
+function setMode(payload, opts) {
+  if (opts.send) payload.send = true;
+  else if (opts.open) payload.open = true;
+  else payload.draft = true;
+  return payload;
+}
+
+async function readBody(opts) {
+  if (opts.bodyFile) {
+    const { readFileSync } = await import("fs");
+    return readFileSync(opts.bodyFile, "utf-8");
+  }
+  return opts.body;
 }
 
 // ─── Health ───────────────────────────────────────────────────────────
@@ -398,21 +422,46 @@ program
 
 program
   .command("delete <messageIds>")
-  .description("Delete message(s) (to trash)")
-  .option("--permanent", "permanently delete (skip trash)")
+  .description("Move message(s) to the account's Trash (drafts need bridge policy draft, other mail organize)")
+  .option("--drafts-only", "only delete drafts; other ids are reported, not touched")
+  .option("--permanent", "permanently delete (skip trash; bridge policy full)")
   .option("--confirm", "required for permanent delete")
   .action(run(async (messageIds, opts) => {
     const g = program.opts();
     const fmt = g.format;
+    const timeout = getTimeout(g);
     if (opts.permanent && !opts.confirm) {
       outputError({ message: "Use --confirm for permanent delete", code: "INVALID_ARGS" }, fmt);
       return;
     }
     const ids = parseIds(messageIds);
-    const data = await api("POST", "/messages/delete", {
-      messageIds: ids,
-      permanent: opts.permanent || false,
-    }, getTimeout(g));
+    if (opts.permanent) {
+      const data = await api("POST", "/messages/delete", { messageIds: ids, permanent: true }, timeout);
+      output(data, fmt, getOutputOpts(g));
+      return;
+    }
+    // Drafts first: allowed at policy "draft"; the rest needs "organize".
+    const drafts = await api("POST", "/messages/trash", { messageIds: ids, draftsOnly: true }, timeout);
+    const rest = drafts.notDrafts || [];
+    if (opts.draftsOnly || drafts.error || rest.length === 0) {
+      output(drafts, fmt, getOutputOpts(g));
+      return;
+    }
+    let others;
+    try {
+      others = await api("POST", "/messages/trash", { messageIds: rest }, timeout);
+    } catch (err) {
+      if (drafts.deleted) {
+        err.message = `Moved ${drafts.deleted} draft(s) to the trash; messages ${rest.join(", ")} are not drafts and were not deleted: ${err.message}`;
+      }
+      throw err;
+    }
+    if (others.error) {
+      output(others, fmt, getOutputOpts(g));
+      return;
+    }
+    const data = { success: true, deleted: (drafts.deleted || 0) + (others.deleted || 0), movedTo: "trash" };
+    if (others.alreadyInTrash) Object.assign(data, { alreadyInTrash: others.alreadyInTrash, note: others.note });
     output(data, fmt, getOutputOpts(g));
   }));
 
@@ -526,21 +575,16 @@ program
   .option("--from <identityId>", "send from specific identity")
   .option("--priority <level>", "priority: highest|high|normal|low|lowest")
   .option("--header <key:value>", "custom header")
+  .option("--attach <path>", "attach a local file (repeatable)", collect, [])
   .option("--draft", "save as draft (default)")
   .option("--open", "open compose window")
   .option("--send", "send immediately")
   .action(run(async (opts) => {
     const g = program.opts();
-    let body = opts.body || "";
-    if (opts.bodyFile) {
-      const { readFileSync } = await import("fs");
-      body = readFileSync(opts.bodyFile, "utf-8");
-    }
-
     const payload = {
       to: opts.to,
       subject: opts.subject || "",
-      body,
+      body: (await readBody(opts)) || "",
       isHTML: opts.html || false,
     };
     if (opts.cc) payload.cc = opts.cc;
@@ -548,17 +592,44 @@ program
     if (opts.from) payload.identityId = opts.from;
     if (opts.priority) payload.priority = opts.priority;
     if (opts.header) payload.header = opts.header;
+    const attachments = readAttachmentFiles(opts.attach);
+    if (attachments) payload.attachments = attachments;
+    setMode(payload, opts);
 
-    // Mode: send, open, or draft (default)
-    if (opts.send) {
-      payload.send = true;
-    } else if (opts.open) {
-      payload.open = true;
-    } else {
-      payload.draft = true;
-    }
+    const data = await api("POST", "/compose", payload, composeTimeout(g, payload));
+    output(data, g.format, getOutputOpts(g));
+  }));
 
-    const data = await api("POST", "/compose", payload, getTimeout(g));
+// ─── Draft Edit ───────────────────────────────────────────────────────
+
+program
+  .command("draft-edit <draftId>")
+  .description("Edit a saved draft: only given fields change; saved under a new id, the old draft goes to the trash")
+  .option("--to <address>", "replace recipient(s)")
+  .option("--cc <address>", "replace CC")
+  .option("--bcc <address>", "replace BCC")
+  .option("--subject <text>", "replace subject")
+  .option("--body <text>", "replace the whole body")
+  .option("--body-file <path>", "replace the body from a file")
+  .option("--html", "body is HTML")
+  .option("--from <identityId>", "send from another identity")
+  .option("--attach <path>", "add a local file (repeatable)", collect, [])
+  .option("--remove-attachment <name>", "remove an attachment by file name (repeatable)", collect, [])
+  .option("--open", "open the edited draft in a compose window instead of saving it")
+  .option("--send", "send the edited draft immediately")
+  .action(run(async (draftId, opts) => {
+    const g = program.opts();
+    const payload = { draftId: parseInt(draftId) };
+    for (const key of ["to", "cc", "bcc", "subject"]) if (opts[key] !== undefined) payload[key] = opts[key];
+    const body = await readBody(opts);
+    if (body !== undefined) Object.assign(payload, { body, isHTML: opts.html || false });
+    if (opts.from) payload.identityId = opts.from;
+    const attachments = readAttachmentFiles(opts.attach);
+    if (attachments) payload.attachments = attachments;
+    if (opts.removeAttachment.length) payload.removeAttachments = opts.removeAttachment;
+    setMode(payload, opts);
+
+    const data = await api("POST", "/drafts/update", payload, composeTimeout(g, payload));
     output(data, g.format, getOutputOpts(g));
   }));
 
@@ -571,32 +642,22 @@ program
   .option("--body-file <path>", "read reply from file")
   .option("--all", "reply to all")
   .option("--html", "body is HTML")
+  .option("--attach <path>", "attach a local file (repeatable)", collect, [])
   .option("--draft", "save as draft (default)")
   .option("--open", "open compose window")
   .option("--send", "send immediately")
   .action(run(async (messageId, opts) => {
     const g = program.opts();
-    let body = opts.body || "";
-    if (opts.bodyFile) {
-      const { readFileSync } = await import("fs");
-      body = readFileSync(opts.bodyFile, "utf-8");
-    }
-
     const payload = {
       messageId: parseInt(messageId),
-      body,
+      body: (await readBody(opts)) || "",
       replyAll: opts.all || false,
     };
+    const attachments = readAttachmentFiles(opts.attach);
+    if (attachments) payload.attachments = attachments;
+    setMode(payload, opts);
 
-    if (opts.send) {
-      payload.send = true;
-    } else if (opts.open) {
-      payload.open = true;
-    } else {
-      payload.draft = true;
-    }
-
-    const data = await api("POST", "/reply", payload, getTimeout(g));
+    const data = await api("POST", "/reply", payload, composeTimeout(g, payload));
     output(data, g.format, getOutputOpts(g));
   }));
 
@@ -607,6 +668,7 @@ program
   .description("Forward a message")
   .requiredOption("--to <address>", "forward to")
   .option("--body <text>", "additional text")
+  .option("--attach <path>", "attach a local file (repeatable)", collect, [])
   .option("--draft", "save as draft (default)")
   .option("--open", "open compose window")
   .option("--send", "send immediately")
@@ -617,16 +679,11 @@ program
       to: opts.to,
       body: opts.body || "",
     };
+    const attachments = readAttachmentFiles(opts.attach);
+    if (attachments) payload.attachments = attachments;
+    setMode(payload, opts);
 
-    if (opts.send) {
-      payload.send = true;
-    } else if (opts.open) {
-      payload.open = true;
-    } else {
-      payload.draft = true;
-    }
-
-    const data = await api("POST", "/forward", payload, getTimeout(g));
+    const data = await api("POST", "/forward", payload, composeTimeout(g, payload));
     output(data, g.format, getOutputOpts(g));
   }));
 

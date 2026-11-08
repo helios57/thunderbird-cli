@@ -7,6 +7,14 @@
 import { createServer } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "crypto";
+import { spawn } from "child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
+
+const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "cli", "src", "cli.js");
+const deleteCalls = [];
 
 const PORT = 19700;
 const WS_PORT = 19701;
@@ -30,6 +38,15 @@ function handle({ method, path, body }) {
   if (path === "/messages/move") return { success: true, moved: (body?.messageIds || []).length };
   if (path === "/messages/copy") return { success: true, copied: (body?.messageIds || []).length };
   if (path === "/messages/delete") return { success: true, deleted: (body?.messageIds || []).length };
+  if (path === "/messages/trash") {
+    deleteCalls.push(body);
+    const ids = body?.messageIds || [];
+    if (body?.draftsOnly) {
+      const others = ids.filter((id) => id < 500); // ids >= 500 stand for drafts
+      return { success: true, deleted: ids.length - others.length, movedTo: "trash", ...(others.length ? { notDrafts: others } : {}) };
+    }
+    return { success: true, deleted: ids.length, movedTo: "trash" };
+  }
   if (path === "/messages/update") return { success: true };
   if (path?.match(/\/raw$/)) return { raw: "From: a@b\nSubject: T\n\nBody" };
   if (path?.match(/\/headers$/)) return { id: 1, subject: "T", author: "a@b" };
@@ -42,9 +59,10 @@ function handle({ method, path, body }) {
   if (path?.match(/^\/messages\/\d+$/) && method === "GET") return { id: 1, subject: "T", author: "a@b", date: "2026-04-01", read: false, flagged: false, junk: false, size: 100, tags: ["$l1"], folder: null, parts: { text: "Hello world", html: "", attachments: [] } };
   if (path === "/tags") return [{ key: "$l1", tag: "Important", color: "#FF0000" }];
   if (path === "/tags/create") return { success: true, ...body };
-  if (path === "/compose") return { success: true, action: body?.send ? "sent" : body?.open ? "draft_opened" : "draft_saved" };
-  if (path === "/reply") return { success: true, action: body?.send ? "sent" : "draft_saved" };
-  if (path === "/forward") return { success: true, action: body?.send ? "sent" : "draft_saved" };
+  if (path === "/drafts/update") return { success: true, action: "draft_saved", draftId: 901, _body: body };
+  if (path === "/compose") return { success: true, action: body?.send ? "sent" : body?.open ? "draft_opened" : "draft_saved", _body: body };
+  if (path === "/reply") return { success: true, action: body?.send ? "sent" : "draft_saved", _body: body };
+  if (path === "/forward") return { success: true, action: body?.send ? "sent" : "draft_saved", _body: body };
   if (path === "/stats") return { totalAccounts: 1, totalUnread: 5, totalMessages: 100, accounts: [] };
   if (path === "/recent") return { messages: [], total: 0, since: new Date().toISOString() };
   if (path === "/contacts/search") return [{ id: "c1", name: "John", email: "j@e.com" }];
@@ -191,6 +209,49 @@ console.log("\n\x1b[1mBulk\x1b[0m");
 test("POST /bulk/delete", await httpCall("POST", "/bulk/delete", { folderId: "f1" }), r => r.success);
 test("POST /bulk/tag", await httpCall("POST", "/bulk/tag", { folderId: "f1", tagKey: "$l1" }), r => r.success);
 test("POST /bulk/fetch", await httpCall("POST", "/bulk/fetch", { folderId: "f1" }), r => r.success);
+
+console.log("\n\x1b[1mCLI: attachments, draft edit, delete\x1b[0m");
+function tb(...args) {
+  return new Promise((resolve) => {
+    const proc = spawn(process.execPath, [CLI, ...args], {
+      env: { ...process.env, TB_BRIDGE_HOST: "127.0.0.1", TB_BRIDGE_PORT: String(PORT), TB_AUTH_TOKEN: "",
+        TB_CONFIG_PATH: join(dirname(fileURLToPath(import.meta.url)), "__no_config__.json") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "", err = "";
+    proc.stdout.on("data", (c) => { out += c; });
+    proc.stderr.on("data", (c) => { err += c; });
+    proc.on("exit", (code) => {
+      let json = null;
+      try { json = JSON.parse(out || err); } catch {}
+      resolve({ code, json, out, err });
+    });
+  });
+}
+const upDir = mkdtempSync(join(tmpdir(), "tb-cli-up-"));
+const fileA = join(upDir, "a.pdf");
+writeFileSync(fileA, "PDF-A");
+const composed = await tb("compose", "--to", "x@y.z", "--body", "Hi", "--attach", fileA, "--attach", fileA);
+test("tb compose --attach (repeatable) sends name + base64", composed.json, r =>
+  r?.ok && r.data._body.attachments?.length === 2 && r.data._body.attachments[0].name === "a.pdf" &&
+  Buffer.from(r.data._body.attachments[0].data, "base64").toString() === "PDF-A");
+test("tb compose --attach with a missing file fails before the bridge", (await tb("compose", "--to", "x@y.z", "--attach", join(upDir, "nope.pdf"))).json,
+  r => r?.ok === false && r.code === "NOT_FOUND");
+const replied = await tb("reply", "1", "--body", "Danke", "--attach", fileA);
+test("tb reply --attach", replied.json, r => r?.ok && r.data._body.attachments?.length === 1);
+const edited = await tb("draft-edit", "501", "--subject", "Neu", "--attach", fileA, "--remove-attachment", "alt.pdf");
+test("tb draft-edit sends only what changes", edited.json, r =>
+  r?.ok && r.data._body.draftId === 501 && r.data._body.subject === "Neu" && !("to" in r.data._body) && !("body" in r.data._body) &&
+  JSON.stringify(r.data._body.removeAttachments) === '["alt.pdf"]' && r.data._body.attachments?.length === 1 && r.data._body.draft === true);
+deleteCalls.length = 0;
+const del = await tb("delete", "501,1");
+test("tb delete moves drafts first, then the rest", del.json, r =>
+  r?.ok && r.data.deleted === 2 && deleteCalls.length === 2 && deleteCalls[0].draftsOnly && JSON.stringify(deleteCalls[1].messageIds) === "[1]");
+deleteCalls.length = 0;
+const delDrafts = await tb("delete", "501,1", "--drafts-only");
+test("tb delete --drafts-only leaves other mail alone", delDrafts.json, r =>
+  r?.ok && r.data.deleted === 1 && JSON.stringify(r.data.notDrafts) === "[1]" && deleteCalls.length === 1);
+rmSync(upDir, { recursive: true, force: true });
 
 console.log(`\n\x1b[1m${"─".repeat(40)}\x1b[0m`);
 console.log(`\x1b[1m${passed} passed, ${failed} failed, ${passed + failed} total\x1b[0m\n`);

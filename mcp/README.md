@@ -20,12 +20,12 @@ Exposes 12 email management tools to Claude Desktop:
 | `email_list` | List folder contents with sort/pagination |
 | `email_read` | Read message (5 modes: default, headers, full, raw, check-download) |
 | `email_thread` | Get full conversation thread |
-| `email_compose` | Send/draft new email (default: draft, never auto-sends) |
-| `email_reply` | Reply to message (default: draft) |
-| `email_forward` | Forward to new recipient (default: draft) |
+| `email_compose` | Send/draft new email, or edit a saved draft (`draftId`); `attachments` = local file paths (default: draft, never auto-sends) |
+| `email_reply` | Reply to message, with optional `attachments` (default: draft) |
+| `email_forward` | Forward to new recipient, with optional `attachments` (default: draft) |
 | `email_mark` | Read/flagged/junk flags and tags — add, remove or replace (batch supported) |
-| `email_archive` | Archive, move, or delete messages |
-| `email_attachments` | List + download attachments (base64) |
+| `email_archive` | Archive, move, or delete messages (delete = move to the account's Trash) |
+| `email_attachments` | List + download attachments (saved to disk, one or all) |
 | `email_folders` | List folders, get info, trigger sync |
 
 **Safe defaults:** compose/reply/forward all default to **draft mode**. Claude must explicitly pass `mode: "send"` to actually send anything. Permanent delete requires `confirm: true`.

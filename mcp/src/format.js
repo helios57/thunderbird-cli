@@ -2,9 +2,9 @@
  * Output shaping for MCP tool results: keep what an agent needs, drop what only costs tokens.
  */
 
-import { mkdirSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { homedir, tmpdir } from "os";
+import { basename, isAbsolute, join } from "path";
 
 // ─── HTML → text ────────────────────────────────────────────────────
 
@@ -120,4 +120,40 @@ export function saveAttachment(messageId, partName, file) {
   const bytes = Buffer.from(file.data || "", "base64");
   writeFileSync(path, bytes);
   return { saved: true, path, name: file.name, contentType: file.contentType, size: bytes.length };
+}
+
+// Total size of files one compose call may attach. Most mail providers reject messages above
+// 20–25 MB, and the files travel base64-encoded (+1/3) through the bridge (32 MiB body limit).
+export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+const argError = (message, code = "INVALID_ARGS") => Object.assign(new Error(message), { code });
+
+/**
+ * Local files to attach, as [{ name, data: base64 }] for the bridge. A pure WebExtension cannot
+ * open file paths, so the file is read here, where it lies; no copy is made. Paths must be
+ * absolute (or start with ~): the server's working directory is whatever the MCP client chose.
+ */
+export function readAttachmentFiles(paths) {
+  if (paths == null) return undefined;
+  const list = Array.isArray(paths) ? paths : [paths];
+  const files = list.map((p) => {
+    if (typeof p !== "string" || !p.trim()) throw argError("attachments must be a list of file paths");
+    const raw = p.trim();
+    const path = /^~(?=$|[\\/])/.test(raw) ? join(homedir(), raw.slice(1)) : raw;
+    if (!isAbsolute(path)) throw argError(`Attachment path must be absolute: ${p}`);
+    let st;
+    try {
+      st = statSync(path);
+    } catch {
+      throw argError(`Attachment not found: ${path}`, "NOT_FOUND");
+    }
+    if (!st.isFile()) throw argError(`Attachment is not a file: ${path}`);
+    return { path, size: st.size };
+  });
+  const total = files.reduce((n, f) => n + f.size, 0);
+  if (total > MAX_UPLOAD_BYTES) {
+    throw argError(`Attachments total ${(total / 1048576).toFixed(1)} MB; the limit is ${MAX_UPLOAD_BYTES / 1048576} MB per message ` +
+      "(mail providers reject larger messages). Send a link or split the files across messages.");
+  }
+  return files.map(({ path }) => ({ name: basename(path), data: readFileSync(path).toString("base64") }));
 }

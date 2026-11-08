@@ -21,7 +21,7 @@
 │       ┌────────────────────┬──────────────────────┐         │
 │       ↕                    ↕                      ↕         │
 │  tb CLI (Node)      tb-mcp Server          Direct HTTP      │
-│  (38 commands)      (12 MCP tools)         (curl, scripts)  │
+│  (39 commands)      (12 MCP tools)         (curl, scripts)  │
 │       ↕                    ↕                                │
 │  AI Agent           Claude Desktop                          │
 │  (Claude Code)      (stdio MCP transport)                   │
@@ -40,7 +40,7 @@
 | **Thunderbird** | Host | Source of truth. Stores all emails, syncs IMAP, renders UI for human oversight |
 | **Extension** (background.js) | Inside Thunderbird | Pure WebExtension. Connects to bridge via WebSocket. Translates bridge requests into `messenger.*` API calls |
 | **Bridge** (bridge.js) | Host (daemon) | Stateless HTTP↔WebSocket proxy. Receives HTTP from CLI/MCP, forwards to extension, returns response. No business logic |
-| **CLI** (tb) | Host or Docker | Thin HTTP client. Parses args, calls bridge, outputs JSON to stdout. 38 commands. Zero state |
+| **CLI** (tb) | Host or Docker | Thin HTTP client. Parses args, calls bridge, outputs JSON to stdout. 39 commands. Zero state |
 | **MCP Server** (tb-mcp) | Host (alongside Claude Desktop) | Stdio-based MCP server. Exposes 12 curated tools to Claude Desktop and other MCP clients. Reuses CLI's HTTP client to call bridge |
 
 ### Key Design Principles
@@ -346,12 +346,31 @@ tb move <id1,id2,id3> <destinationFolderId>
 tb copy <messageId> <destinationFolderId>
 tb copy <id1,id2,id3> <destinationFolderId>
 
-# Delete (to trash)
+# Delete = move to the account's Trash folder (recoverable). Drafts first: deleting drafts
+# needs bridge policy "draft", other mail "organize". Messages already in Trash stay there.
 tb delete <messageId>
 tb delete <id1,id2,id3>
+tb delete <ids> --drafts-only            # only drafts; other ids are reported, untouched
 
-# Permanent delete (skip trash) — requires --confirm flag
+# Permanent delete (skip trash) — requires --confirm flag and policy "full"
 tb delete <messageId> --permanent --confirm
+```
+
+HTTP: `POST /messages/trash { messageIds, draftsOnly? }` (policy `organize`; with `draftsOnly`
+`draft`). The extension moves the messages to their account's Trash folder itself instead of
+calling `messages.delete(ids, false)`, which follows the account's deletion setting (an IMAP
+account set to "remove immediately" deletes for good; deleting inside Trash is always
+permanent). With `draftsOnly`, only messages in a Drafts folder move; the others come back in
+`notDrafts`. Result: `{ success, deleted, movedTo: "trash", notDrafts?, alreadyInTrash? }`.
+Every id is checked before anything moves; an account without a Trash folder fails the whole
+request. `POST /messages/delete { messageIds, permanent? }` stays at policy `full` (without
+`permanent` it, too, moves to the trash).
+
+These are separate routes, not flags on `/messages/delete`, on purpose: an extension older than
+2.1.1.6 answers `Not found` to an unknown route, but would ignore an unknown `draftsOnly` flag and
+delete whatever it was given.
+
+```bash
 
 # Archive
 tb archive <messageId>
@@ -372,13 +391,37 @@ tb compose [options]
   --from <identityId>      # send from specific identity
   --priority <1-5>         # message priority (1=highest, 5=lowest)
   --header <key:value>     # add custom header (repeatable)
+  --attach <path>          # attach a local file (repeatable; at most 20 MB per message)
   --draft                  # save as draft, don't open compose window (default)
   --open                   # open in Thunderbird compose window
   --send                   # send immediately (use with caution)
 
 # Default behavior: --draft (saves draft, returns draftId)
 # AI agents should compose with --draft, let human review in Thunderbird
+
+# Edit a saved draft: only the given fields change
+tb draft-edit <draftId> [options]
+  --to / --cc / --bcc / --subject   # replace
+  --body <text> / --body-file <p>   # replace the whole body (--html for HTML)
+  --attach <path>                   # add a file (repeatable)
+  --remove-attachment <name>        # remove by file name (repeatable)
+  --open | --send                   # instead of saving
 ```
+
+Attachments travel as `attachments: [{ name, data: base64, contentType? }]` on `/compose`,
+`/reply` and `/forward`: a pure WebExtension cannot open file paths, so the CLI / MCP server
+reads each file where it lies. The extension adds them with `compose.addAttachment()`; if that
+fails, the compose window is closed unsaved. The result of a saved draft carries `draftId`.
+
+Editing is `POST /drafts/update { draftId, to?, cc?, bcc?, subject?, body?, isHTML?, identityId?,
+attachments?, removeAttachments?, open?, send? }` (policy `draft`, `full` with `send`).
+`compose.beginNew(draftId)` opens the draft "as new"
+(recipients, body, attachments and References carry over), so the edited draft is saved under a
+new id and the original is moved to the trash (`replacedDraftId`, `originalDraftDeleted`).
+`attachments` in the result lists every attachment of the edited draft. The draft keeps its
+format (plain text or HTML; `isHTML` with a body makes it HTML): Thunderbird would otherwise
+reopen it in the account's default editor. Only messages in a Drafts folder can be edited. With
+`--open` the original is kept.
 
 ### 12. Reply & Forward
 
@@ -389,6 +432,7 @@ tb reply <messageId> [options]
   --body-file <path>       # read body from file
   --html                   # HTML reply
   --all                    # reply to all
+  --attach <path>          # attach a local file (repeatable)
   --draft                  # save as draft (default)
   --open                   # open in Thunderbird compose window
   --send                   # send immediately
@@ -397,6 +441,7 @@ tb reply <messageId> [options]
 tb forward <messageId> [options]
   --to <address>           # required
   --body <text>            # additional message
+  --attach <path>          # attach a local file (repeatable)
   --draft                  # default
   --open
   --send
@@ -414,6 +459,8 @@ tb attachment-download <messageId> <partName> --output <path>
 
 # Download all attachments
 tb attachment-download <messageId> --all --output-dir <dir>
+
+# Attach local files: see --attach on compose / reply / forward / draft-edit
 ```
 
 ### 14. Recent / Timeline
@@ -578,6 +625,8 @@ covered by it.
 | `AUTH_REQUIRED` | Bridge requires `TB_AUTH_TOKEN`; the request had none or the wrong one |
 | `FORBIDDEN` | Bridge refused a browser `Origin` or non-local `Host` header (see `TB_BRIDGE_CORS_ORIGINS`, `TB_BRIDGE_ALLOWED_HOSTS`) |
 | `TIMEOUT` | Request to extension timed out (bridge answers HTTP 504 with this code) |
+| `POLICY_DENIED` | The bridge's access policy (`TB_BRIDGE_POLICY`) does not allow the request (HTTP 403); the message names the needed level |
+| `PAYLOAD_TOO_LARGE` | Request body above `TB_BRIDGE_MAX_BODY_BYTES` (default 32 MiB), e.g. too many attachments (HTTP 413) |
 | `NOT_FOUND` | Message/folder/account not found |
 | `INVALID_ARGS` | Bad CLI arguments |
 | `THUNDERBIRD_ERROR` | Error from Thunderbird messenger API |
@@ -621,7 +670,7 @@ Timeout: 30 seconds. Configurable via `--timeout <ms>` flag on CLI.
 | Raw message | `messenger.messages.getRaw()` | ✅ Implemented |
 | Move messages | `messenger.messages.move()` | ✅ Implemented |
 | Copy messages | `messenger.messages.copy()` | ✅ Implemented |
-| Delete messages | `messenger.messages.delete()` | ✅ Implemented |
+| Delete messages | `messenger.messages.move()` to the account's Trash; `delete(ids, true)` for permanent | ✅ Implemented |
 | Update flags | `messenger.messages.update()` | ✅ Implemented |
 | Tags | `messenger.messages.listTags()` | ✅ Implemented |
 | Create tag | `messenger.messages.createTag()` | ✅ Implemented |
@@ -630,6 +679,8 @@ Timeout: 30 seconds. Configurable via `--timeout <ms>` flag on CLI.
 | Forward | `messenger.compose.beginForward()` | ✅ Implemented |
 | Send | `messenger.compose.sendMessage()` | ✅ Implemented |
 | Save draft | `messenger.compose.saveMessage()` | ✅ Implemented |
+| Attach files | `messenger.compose.addAttachment()` | ✅ Implemented |
+| Edit draft | `messenger.compose.beginNew(draftId)` + `listAttachments()` / `removeAttachment()` | ✅ Implemented |
 | Contacts | `messenger.contacts.list()` | ✅ Implemented |
 | Contact search | `messenger.contacts.list()` + filter | ✅ Implemented |
 | Archive | `messenger.messages.archive()` | ✅ Implemented |
@@ -1030,7 +1081,7 @@ Claude Desktop ──stdio JSON-RPC──> tb-mcp ──HTTP──> Bridge ─�
 The MCP server:
 - Has **no state** — every tool call is independent
 - **Reuses** `cli/src/client.js` for HTTP calls (no code duplication)
-- Exposes **12 high-level tools** rather than all 38 CLI commands
+- Exposes **12 high-level tools** rather than all 39 CLI commands
 - Defaults to **safe behavior** (compose/reply/forward → draft, not send)
 
 ### Tool Catalog
@@ -1044,7 +1095,7 @@ The 12 MCP tools are **curated** for AI agent use cases. Bulk admin operations (
 | `email_list` | `tb list` |
 | `email_read` | `tb read` (5 modes) |
 | `email_thread` | `tb thread` |
-| `email_compose` | `tb compose` (draft/open/send modes) |
+| `email_compose` | `tb compose` (draft/open/send modes, attachments), `tb draft-edit` (with `draftId`) |
 | `email_reply` | `tb reply` |
 | `email_forward` | `tb forward` |
 | `email_mark` | `tb mark` (batch) |
@@ -1054,7 +1105,7 @@ The 12 MCP tools are **curated** for AI agent use cases. Bulk admin operations (
 
 ### Why fewer MCP tools than CLI commands?
 
-| | CLI (38 commands) | MCP (12 tools) |
+| | CLI (39 commands) | MCP (12 tools) |
 |---|---|---|
 | Audience | Humans + scripts | AI agents |
 | Discovery | `tb --help` | Tool descriptions in LLM context |

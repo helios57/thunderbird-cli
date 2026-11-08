@@ -11,7 +11,7 @@
  */
 
 import { parseRelativeDate } from "./client.js";
-import { htmlToText, saveAttachment, shapeMessages, pickFields } from "./format.js";
+import { htmlToText, readAttachmentFiles, saveAttachment, shapeMessages, pickFields } from "./format.js";
 
 // Default cap on body text returned by email_read (characters). Keeps one long newsletter from
 // eating the agent's context; pass maxBody: 0 for no limit.
@@ -27,9 +27,86 @@ const FIELDS_SCHEMA = {
     "Only return these message fields, e.g. [\"id\",\"date\",\"author\",\"subject\"] — cheapest for scanning many results. Default: all non-empty fields.",
 };
 
+// Saving a draft with attachments (or editing one) can take a while on IMAP.
+const COMPOSE_TIMEOUT_MS = 120000;
+
+const ATTACHMENTS_SCHEMA = {
+  type: "array",
+  items: { type: "string" },
+  description:
+    "Local files to attach, as absolute paths (e.g. C:\\Users\\me\\Documents\\Rechnung.pdf). Each file is read where it is; at most 20 MB in total.",
+};
+
 function truncate(text, max) {
   if (!max || !text || text.length <= max) return { text, truncated: false };
   return { text: text.slice(0, max) + "\n...[truncated]", truncated: true };
+}
+
+/** Draft / open / send flags shared by compose, reply and forward. */
+function applyMode(payload, mode = "draft") {
+  if (mode === "send") payload.send = true;
+  else if (mode === "open") payload.open = true;
+  else payload.draft = true;
+  return payload;
+}
+
+const OLD_ADDON = "The Thunderbird add-on is older than 2.1.1.6 and cannot do this yet; install the current XPI (see docs).";
+
+/** An extension that does not know a route answers { error: "Not found: ..." }. */
+function checkRouteKnown(result) {
+  if (typeof result?.error === "string" && result.error.startsWith("Not found:")) {
+    throw Object.assign(new Error(OLD_ADDON), { code: "THUNDERBIRD_ERROR" });
+  }
+  return result;
+}
+
+/** Compose-type call with the right timeout, and a readable error when files are too big. */
+async function composeCall(api, path, payload) {
+  const slow = payload.attachments?.length || payload.draftId != null;
+  let result;
+  try {
+    result = checkRouteKnown(await api("POST", path, payload, slow ? COMPOSE_TIMEOUT_MS : undefined));
+  } catch (err) {
+    if (err.code === "PAYLOAD_TOO_LARGE") {
+      err.message = "Attachments are larger than the bridge accepts (TB_BRIDGE_MAX_BODY_BYTES, default 32 MiB; files grow by a third in transit).";
+    }
+    throw err;
+  }
+  // An older add-on ignores `attachments` and saves the mail without them.
+  if (payload.attachments?.length && result?.success && !result.attachments) {
+    throw Object.assign(new Error(`The mail was saved WITHOUT the attachments (action: ${result.action}). ${OLD_ADDON}`), {
+      code: "THUNDERBIRD_ERROR",
+    });
+  }
+  return result;
+}
+
+/**
+ * Move messages to the trash, drafts first: the bridge allows deleting drafts at policy "draft",
+ * other mail needs "organize". So a draft-only batch works at "draft", and a mixed batch tells
+ * exactly which ids were refused.
+ */
+async function deleteToTrash(api, messageIds) {
+  const drafts = checkRouteKnown(await api("POST", "/messages/trash", { messageIds, draftsOnly: true }));
+  const rest = drafts?.notDrafts || [];
+  if (drafts?.error || rest.length === 0) return drafts;
+  let others;
+  try {
+    others = await api("POST", "/messages/trash", { messageIds: rest });
+  } catch (err) {
+    if (drafts.deleted) {
+      err.message = `Moved ${drafts.deleted} draft(s) to the trash; messages ${rest.join(", ")} are not drafts and were not deleted: ${err.message}`;
+    }
+    throw err;
+  }
+  if (others?.error) return others;
+  const result = { success: true, deleted: (drafts.deleted || 0) + (others.deleted || 0), movedTo: "trash" };
+  const inTrash = [...(drafts.alreadyInTrash || []), ...(others.alreadyInTrash || [])];
+  if (inTrash.length) {
+    result.alreadyInTrash = inTrash;
+    result.note = others.note || drafts.note;
+  }
+  return result;
 }
 
 export const tools = [
@@ -341,13 +418,19 @@ export const tools = [
   {
     name: "email_compose",
     description:
-      "Compose a new email. Default mode is 'draft' (saved to Drafts folder, not sent). Use mode='send' to send immediately, mode='open' to open in Thunderbird's compose window for human review. ALWAYS prefer draft mode unless the human explicitly asked to send.",
+      "Compose a new email, or edit a saved draft (draftId). Default mode is 'draft' (saved to Drafts folder, not sent; the result has its draftId). Use mode='send' to send immediately, mode='open' to open in Thunderbird's compose window for human review. ALWAYS prefer draft mode unless the human explicitly asked to send. " +
+      "attachments: local file paths to attach. " +
+      "Editing a draft (draftId): only the fields you pass change (to/cc/bcc/subject replace, body replaces the whole text), attachments are added, removeAttachments removes by file name; the edited draft is saved under a new draftId and the old one goes to the trash.",
     inputSchema: {
       type: "object",
       properties: {
+        draftId: {
+          type: "number",
+          description: "Edit this saved draft (message id of a mail in a Drafts folder) instead of composing a new one",
+        },
         to: {
           type: "string",
-          description: "Recipient(s), comma-separated for multiple",
+          description: "Recipient(s), comma-separated for multiple. Required for a new message",
         },
         cc: { type: "string", description: "CC recipients" },
         bcc: { type: "string", description: "BCC recipients" },
@@ -373,25 +456,49 @@ export const tools = [
           description: "draft (default, saves silently), open (compose window), send (immediate)",
           default: "draft",
         },
+        attachments: ATTACHMENTS_SCHEMA,
+        removeAttachments: {
+          type: "array",
+          items: { type: "string" },
+          description: "With draftId: names of the draft's attachments to remove (as listed by email_attachments)",
+        },
       },
-      required: ["to", "body"],
     },
     handler: async (args, api) => {
+      const attachments = readAttachmentFiles(args.attachments);
+      if (args.draftId != null) {
+        const payload = { draftId: args.draftId };
+        for (const key of ["to", "cc", "bcc", "subject", "body"]) {
+          if (args[key] !== undefined) payload[key] = args[key];
+        }
+        if (args.body !== undefined) payload.isHTML = args.html || false;
+        if (args.from) payload.identityId = args.from;
+        if (attachments?.length) payload.attachments = attachments;
+        if (args.removeAttachments?.length) payload.removeAttachments = args.removeAttachments;
+        return await composeCall(api, "/drafts/update", applyMode(payload, args.mode));
+      }
+      if (!args.to) {
+        throw Object.assign(new Error("email_compose needs `to` for a new message (or draftId to edit a draft)"), {
+          code: "INVALID_ARGS",
+        });
+      }
+      if (args.removeAttachments?.length) {
+        throw Object.assign(new Error("removeAttachments only applies when editing a draft (draftId)"), {
+          code: "INVALID_ARGS",
+        });
+      }
       const payload = {
         to: args.to,
         subject: args.subject || "",
-        body: args.body,
+        body: args.body || "",
         isHTML: args.html || false,
       };
       if (args.cc) payload.cc = args.cc;
       if (args.bcc) payload.bcc = args.bcc;
       if (args.from) payload.identityId = args.from;
       if (args.priority) payload.priority = args.priority;
-      const mode = args.mode || "draft";
-      if (mode === "send") payload.send = true;
-      else if (mode === "open") payload.open = true;
-      else payload.draft = true;
-      return await api("POST", "/compose", payload);
+      if (attachments?.length) payload.attachments = attachments;
+      return await composeCall(api, "/compose", applyMode(payload, args.mode));
     },
   },
 
@@ -399,7 +506,7 @@ export const tools = [
   {
     name: "email_reply",
     description:
-      "Reply to a message. Default mode is 'draft'. Use mode='send' for immediate send. Set replyAll=true to reply to all recipients.",
+      "Reply to a message. Default mode is 'draft' (result has its draftId). Use mode='send' for immediate send. Set replyAll=true to reply to all recipients. attachments: local file paths to attach.",
     inputSchema: {
       type: "object",
       properties: {
@@ -411,6 +518,7 @@ export const tools = [
           enum: ["draft", "open", "send"],
           default: "draft",
         },
+        attachments: ATTACHMENTS_SCHEMA,
       },
       required: ["messageId", "body"],
     },
@@ -420,11 +528,9 @@ export const tools = [
         body: args.body,
         replyAll: args.replyAll || false,
       };
-      const mode = args.mode || "draft";
-      if (mode === "send") payload.send = true;
-      else if (mode === "open") payload.open = true;
-      else payload.draft = true;
-      return await api("POST", "/reply", payload);
+      const attachments = readAttachmentFiles(args.attachments);
+      if (attachments?.length) payload.attachments = attachments;
+      return await composeCall(api, "/reply", applyMode(payload, args.mode));
     },
   },
 
@@ -432,7 +538,7 @@ export const tools = [
   {
     name: "email_forward",
     description:
-      "Forward a message to a new recipient. Default mode is 'draft' for human review.",
+      "Forward a message to a new recipient. Default mode is 'draft' for human review (result has its draftId). attachments: extra local files to attach.",
     inputSchema: {
       type: "object",
       properties: {
@@ -444,6 +550,7 @@ export const tools = [
           enum: ["draft", "open", "send"],
           default: "draft",
         },
+        attachments: ATTACHMENTS_SCHEMA,
       },
       required: ["messageId", "to"],
     },
@@ -453,11 +560,9 @@ export const tools = [
         to: args.to,
         body: args.body || "",
       };
-      const mode = args.mode || "draft";
-      if (mode === "send") payload.send = true;
-      else if (mode === "open") payload.open = true;
-      else payload.draft = true;
-      return await api("POST", "/forward", payload);
+      const attachments = readAttachmentFiles(args.attachments);
+      if (attachments?.length) payload.attachments = attachments;
+      return await composeCall(api, "/forward", applyMode(payload, args.mode));
     },
   },
 
@@ -525,7 +630,8 @@ export const tools = [
   {
     name: "email_archive",
     description:
-      "Archive, move, or delete messages. Operations: 'archive' (move to archive folder), 'move' (to specific folder), 'delete' (to trash). Permanent delete requires confirm=true.",
+      "Archive, move, or delete messages. Operations: 'archive' (move to archive folder), 'move' (to specific folder), 'delete' (move to the account's Trash, recoverable; works for drafts too). " +
+      "Deleting drafts is allowed at bridge policy 'draft', other mail needs 'organize'. Messages already in Trash stay there (alreadyInTrash). Permanent delete (permanent=true) requires confirm=true and policy 'full'.",
     inputSchema: {
       type: "object",
       properties: {
@@ -571,10 +677,10 @@ export const tools = [
         if (args.permanent && !args.confirm) {
           return { error: "Permanent delete requires confirm=true" };
         }
-        return await api("POST", "/messages/delete", {
-          messageIds: args.messageIds,
-          permanent: args.permanent || false,
-        });
+        if (args.permanent) {
+          return await api("POST", "/messages/delete", { messageIds: args.messageIds, permanent: true });
+        }
+        return await deleteToTrash(api, args.messageIds);
       }
       return { error: `Unknown operation: ${args.operation}` };
     },
@@ -584,8 +690,9 @@ export const tools = [
   {
     name: "email_attachments",
     description:
-      "List or download attachments from a message. 'list' returns metadata (name, contentType, size, partName). " +
-      "'download' saves the file to a local download folder and returns its path — open it from there (e.g. read a PDF or image). Set inline=true only if you need the bytes as base64 in the response.",
+      "List or download attachments from a message (drafts included). 'list' returns metadata (name, contentType, size, partName). " +
+      "'download' saves the file to a local download folder and returns its path — open it from there (e.g. read a PDF or image); without partName it saves every attachment. Set inline=true only if you need the bytes as base64 in the response. " +
+      "To attach local files to a mail, use the attachments parameter of email_compose / email_reply / email_forward.",
     annotations: { readOnlyHint: true },
     inputSchema: {
       type: "object",
@@ -598,7 +705,7 @@ export const tools = [
         },
         partName: {
           type: "string",
-          description: "Required for download — get from list operation",
+          description: "download: which attachment (from list). Omit to download all of them",
         },
         inline: {
           type: "boolean",
@@ -612,12 +719,28 @@ export const tools = [
         return await api("GET", `/messages/${args.messageId}/attachments`);
       }
       if (args.operation === "download") {
-        if (!args.partName) return { error: "partName required for download" };
-        const file = await api("POST", `/messages/${args.messageId}/attachment`, {
-          partName: args.partName,
-        }, SEARCH_TIMEOUT_MS);
-        if (args.inline || typeof file?.data !== "string") return file;
-        return saveAttachment(args.messageId, args.partName, file);
+        const fetchPart = (partName) =>
+          api("POST", `/messages/${args.messageId}/attachment`, { partName }, SEARCH_TIMEOUT_MS);
+        if (args.partName) {
+          const file = await fetchPart(args.partName);
+          if (args.inline || typeof file?.data !== "string") return file;
+          return saveAttachment(args.messageId, args.partName, file);
+        }
+        if (args.inline) return { error: "inline needs a partName (one attachment at a time)" };
+        const list = await api("GET", `/messages/${args.messageId}/attachments`);
+        if (!Array.isArray(list)) return list;
+        const files = [];
+        for (const att of list) {
+          try {
+            const file = await fetchPart(att.partName);
+            files.push(typeof file?.data === "string"
+              ? { partName: att.partName, ...saveAttachment(args.messageId, att.partName, file) }
+              : { partName: att.partName, name: att.name, error: file?.error || "no data" });
+          } catch (err) {
+            files.push({ partName: att.partName, name: att.name, error: err.message });
+          }
+        }
+        return { saved: files.filter((f) => f.saved).length, files };
       }
       return { error: `Unknown operation: ${args.operation}` };
     },

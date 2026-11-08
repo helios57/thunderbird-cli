@@ -413,10 +413,26 @@ async function handleRequest({ method, path, body }, ctx = null) {
 
   // ─── Delete ─────────────────────────────────────────────────────
 
+  // Move to the account's Trash (recoverable); draftsOnly limits it to drafts.
+  if (path === "/messages/trash" && method === "POST") {
+    const { messageIds, draftsOnly = false } = body || {};
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
+      return { error: "messageIds must be a non-empty array" };
+    }
+    return await deleteToTrash(messageIds, { draftsOnly });
+  }
+
   if (path === "/messages/delete" && method === "POST") {
-    const { messageIds, permanent = false } = body;
-    await messenger.messages.delete(messageIds, permanent);
-    return { success: true, deleted: messageIds.length };
+    const { messageIds, permanent = false } = body || {};
+    if (!Array.isArray(messageIds) || messageIds.length === 0) {
+      return { error: "messageIds must be a non-empty array" };
+    }
+    if (permanent) {
+      await messenger.messages.delete(messageIds, true);
+      return { success: true, deleted: messageIds.length, permanent: true };
+    }
+    // Without permanent: to the trash, never by the account's deletion setting.
+    return await deleteToTrash(messageIds);
   }
 
   // ─── Update (mark read/flagged/junk/tags) ───────────────────────
@@ -601,75 +617,51 @@ async function handleRequest({ method, path, body }, ctx = null) {
 
   // ─── Compose ────────────────────────────────────────────────────
 
+  if (path === "/drafts/update" && method === "POST") {
+    return await editDraft(body || {});
+  }
+
   if (path === "/compose" && method === "POST") {
-    const { to, cc, bcc, subject, body: msgBody, isHTML = false,
-            identityId, send = false, draft = false, open = false,
-            priority } = body;
+    const { to, cc, bcc, subject, body: msgBody = "", isHTML = false,
+            identityId, send = false, open = false, priority } = body || {};
+    const files = decodeAttachments(body?.attachments); // bad input fails before a window opens
     const details = {};
-    if (to) details.to = Array.isArray(to) ? to : [to];
-    if (cc) details.cc = Array.isArray(cc) ? cc : [cc];
-    if (bcc) details.bcc = Array.isArray(bcc) ? bcc : [bcc];
+    if (to) details.to = recipientList(to);
+    if (cc) details.cc = recipientList(cc);
+    if (bcc) details.bcc = recipientList(bcc);
     if (subject) details.subject = subject;
     if (isHTML) { details.isPlainText = false; details.body = msgBody; }
     else { details.isPlainText = true; details.plainTextBody = msgBody; }
     if (identityId) details.identityId = identityId;
     if (priority) details.customHeaders = [{ name: "X-Priority", value: priorityToValue(priority) }];
     const tab = await messenger.compose.beginNew(null, details);
-    if (send) {
-      await messenger.compose.sendMessage(tab.id, { mode: "sendNow" });
-      return { success: true, action: "sent" };
-    }
-    if (open) {
-      return { success: true, action: "draft_opened", tabId: tab.id };
-    }
-    // Default: save as draft and close
-    await messenger.compose.saveMessage(tab.id, { mode: "draft" });
-    await messenger.tabs.remove(tab.id);
-    return { success: true, action: "draft_saved" };
+    return await finishCompose(tab, { send, open, files });
   }
 
   // ─── Reply ──────────────────────────────────────────────────────
 
   if (path === "/reply" && method === "POST") {
-    const { messageId, body: replyBody, replyAll = false,
-            send = false, draft = false, open = false } = body;
+    const { messageId, body: replyBody = "", replyAll = false,
+            send = false, open = false } = body || {};
+    const files = decodeAttachments(body?.attachments);
     const type = replyAll ? "replyToAll" : "replyToSender";
     const tab = await messenger.compose.beginReply(messageId, type, {
       isPlainText: true, plainTextBody: replyBody,
     });
-    if (send) {
-      await messenger.compose.sendMessage(tab.id, { mode: "sendNow" });
-      return { success: true, action: "sent" };
-    }
-    if (open) {
-      return { success: true, action: "draft_opened", tabId: tab.id };
-    }
-    // Default: save as draft and close
-    await messenger.compose.saveMessage(tab.id, { mode: "draft" });
-    await messenger.tabs.remove(tab.id);
-    return { success: true, action: "draft_saved" };
+    return await finishCompose(tab, { send, open, files });
   }
 
   // ─── Forward ────────────────────────────────────────────────────
 
   if (path === "/forward" && method === "POST") {
     const { messageId, to, body: fwdBody,
-            send = false, draft = false, open = false } = body;
+            send = false, open = false } = body || {};
+    const files = decodeAttachments(body?.attachments);
     const tab = await messenger.compose.beginForward(
       messageId, "forwardAsAttachment",
-      { to: Array.isArray(to) ? to : [to], isPlainText: true, plainTextBody: fwdBody || "" }
+      { to: recipientList(to), isPlainText: true, plainTextBody: fwdBody || "" }
     );
-    if (send) {
-      await messenger.compose.sendMessage(tab.id, { mode: "sendNow" });
-      return { success: true, action: "sent" };
-    }
-    if (open) {
-      return { success: true, action: "draft_opened", tabId: tab.id };
-    }
-    // Default: save as draft and close
-    await messenger.compose.saveMessage(tab.id, { mode: "draft" });
-    await messenger.tabs.remove(tab.id);
-    return { success: true, action: "draft_saved" };
+    return await finishCompose(tab, { send, open, files });
   }
 
   // ─── Stats (GET — legacy) ──────────────────────────────────────
@@ -1120,6 +1112,255 @@ function formatCopies(entry) {
   const others = entry.copies.filter((c) => c !== entry.best).map((c) => c.folder?.path).filter(Boolean);
   if (others.length) out.alsoIn = [...new Set(others)];
   return out;
+}
+
+// ─── Delete ─────────────────────────────────────────────────────────
+
+function hasSpecialUse(folder, use) {
+  return !!folder && ((folder.specialUse || []).includes(use) || folder.type === use);
+}
+
+const isDraft = (msg) => hasSpecialUse(msg?.folder, "drafts");
+
+/** The account's Trash folder (MailFolder), or null. */
+async function findTrashFolder(accountId) {
+  const account = accountId ? await messenger.accounts.get(accountId, true) : null;
+  let found = null;
+  const walk = (folder) => {
+    if (found || !folder) return;
+    if (hasSpecialUse(folder, "trash") && !folder.isVirtual) found = folder;
+    else for (const sub of folder.subFolders || []) walk(sub);
+  };
+  walk(account?.rootFolder);
+  return found;
+}
+
+/**
+ * "Delete" as a move to the account's Trash folder, so it can always be undone. messages.delete()
+ * without skipTrash follows the account's deletion setting instead: an IMAP account set to
+ * "remove immediately" deletes for good, and deleting inside Trash is always permanent. Staying
+ * recoverable is what lets the bridge allow this below policy "full".
+ *
+ * With draftsOnly, only messages in a Drafts folder are moved; the others come back in
+ * notDrafts, untouched. Messages already in Trash stay there (alreadyInTrash): removing them is
+ * a permanent delete. Every id is checked before anything moves.
+ */
+async function deleteToTrash(messageIds, { draftsOnly = false } = {}) {
+  const headers = await mapWithIpcLimit(messageIds, (id) => messenger.messages.get(id));
+  const notDrafts = [];
+  const alreadyInTrash = [];
+  const byAccount = new Map();
+  headers.forEach((msg, i) => {
+    const id = messageIds[i];
+    if (!msg) throw new Error(`Message ${id} not found`);
+    if (draftsOnly && !isDraft(msg)) { notDrafts.push(id); return; }
+    if (hasSpecialUse(msg.folder, "trash")) { alreadyInTrash.push(id); return; }
+    const accountId = msg.folder?.accountId;
+    if (!byAccount.has(accountId)) byAccount.set(accountId, []);
+    byAccount.get(accountId).push(id);
+  });
+
+  const trashes = new Map();
+  for (const accountId of byAccount.keys()) {
+    const trash = await findTrashFolder(accountId);
+    if (!trash) {
+      throw new Error(`Account ${accountId} has no Trash folder; nothing was deleted. ` +
+        "Move the messages to a folder instead, or delete them permanently (permanent: true).");
+    }
+    trashes.set(accountId, trash);
+  }
+
+  let deleted = 0;
+  for (const [accountId, ids] of byAccount) {
+    await messenger.messages.move(ids, trashes.get(accountId));
+    deleted += ids.length;
+  }
+  const result = { success: true, deleted, movedTo: "trash" };
+  if (notDrafts.length) result.notDrafts = notDrafts;
+  if (alreadyInTrash.length) {
+    result.alreadyInTrash = alreadyInTrash;
+    result.note = "Messages already in Trash were left there; removing them from Trash is a permanent delete (permanent: true).";
+  }
+  return result;
+}
+
+// ─── Compose ────────────────────────────────────────────────────────
+
+// Thunderbird stores the content type the File carries; fill it in for common files when the
+// caller sends none.
+const ATTACHMENT_TYPES = {
+  pdf: "application/pdf", txt: "text/plain", csv: "text/csv", html: "text/html", htm: "text/html",
+  ics: "text/calendar", vcf: "text/vcard", xml: "application/xml", json: "application/json",
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+  svg: "image/svg+xml", heic: "image/heic", zip: "application/zip", eml: "message/rfc822",
+  doc: "application/msword", xls: "application/vnd.ms-excel", ppt: "application/vnd.ms-powerpoint",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  odt: "application/vnd.oasis.opendocument.text", ods: "application/vnd.oasis.opendocument.spreadsheet",
+  mp3: "audio/mpeg", mp4: "video/mp4", mov: "video/quicktime",
+};
+
+const recipientList = (v) => (Array.isArray(v) ? v : v ? [v] : []);
+
+function base64ToBytes(b64) {
+  if (typeof Uint8Array.fromBase64 === "function") return Uint8Array.fromBase64(b64);
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * Uploaded attachments ([{ name, data: base64, contentType? }]) as File objects. A pure
+ * WebExtension cannot open local paths, so callers send the bytes.
+ */
+function decodeAttachments(list) {
+  if (list == null) return [];
+  if (!Array.isArray(list)) throw new Error("attachments must be an array of { name, data }");
+  return list.map((a, i) => {
+    if (!a || typeof a.name !== "string" || !a.name.trim() || typeof a.data !== "string") {
+      throw new Error(`attachments[${i}] needs a name and base64 data`);
+    }
+    let bytes;
+    try {
+      bytes = base64ToBytes(a.data);
+    } catch {
+      throw new Error(`attachments[${i}] (${a.name}): data is not valid base64`);
+    }
+    const ext = /\.([0-9a-z]+)$/i.exec(a.name)?.[1]?.toLowerCase();
+    return new File([bytes], a.name, { type: a.contentType || ATTACHMENT_TYPES[ext] || "" });
+  });
+}
+
+/** Close a compose window we could not finish, without Thunderbird asking to save it. */
+async function discardCompose(tabId) {
+  try { await messenger.compose.setComposeDetails(tabId, { isModified: false }); } catch {}
+  try { await messenger.tabs.remove(tabId); } catch {}
+}
+
+/**
+ * Attach files to an open compose window, then send it, leave it open for the human, or save it
+ * as a draft and close it (default). If preparing or attaching fails, the window is closed
+ * unsaved, so a half-built message is never sent or saved.
+ */
+async function finishCompose(tab, { send = false, open = false, files = [], prepare = null, listAll = false } = {}) {
+  let attachments = [];
+  try {
+    if (prepare) await prepare(tab);
+    for (const file of files) {
+      const added = await messenger.compose.addAttachment(tab.id, { file, name: file.name });
+      attachments.push({ name: added?.name ?? file.name, size: file.size });
+    }
+    // An edited draft reports every attachment it now has, not only the added ones.
+    if (listAll) {
+      attachments = (await messenger.compose.listAttachments(tab.id)).map(({ name, size }) => ({ name, size }));
+    }
+  } catch (e) {
+    await discardCompose(tab.id);
+    throw e;
+  }
+  const extra = attachments.length || listAll ? { attachments } : {};
+  if (send) {
+    await messenger.compose.sendMessage(tab.id, { mode: "sendNow" });
+    return { success: true, action: "sent", ...extra };
+  }
+  if (open) return { success: true, action: "draft_opened", tabId: tab.id, ...extra };
+  const saved = await messenger.compose.saveMessage(tab.id, { mode: "draft" });
+  await messenger.tabs.remove(tab.id);
+  const draftId = saved?.messages?.[0]?.id;
+  return { success: true, action: "draft_saved", ...(draftId != null ? { draftId } : {}), ...extra };
+}
+
+async function removeComposeAttachments(tabId, names, draftId) {
+  const current = await messenger.compose.listAttachments(tabId);
+  const missing = names.filter((n) => !current.some((a) => a.name === n));
+  if (missing.length) {
+    const has = current.map((a) => `"${a.name}"`).join(", ") || "none";
+    throw new Error(`Draft ${draftId} has no attachment named ${missing.map((n) => `"${n}"`).join(", ")} ` +
+      `(it has: ${has}); nothing was changed.`);
+  }
+  for (const a of current) {
+    if (names.includes(a.name)) await messenger.compose.removeAttachment(tabId, a.id);
+  }
+}
+
+function plainToHtml(text) {
+  const escaped = String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return escaped.replace(/\r?\n/g, "<br>");
+}
+
+function htmlToPlain(html) {
+  return String(html)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|h[1-6])\s*>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+    .trim();
+}
+
+/**
+ * Edit a saved draft: change recipients, subject or body, add or remove attachments.
+ *
+ * compose.beginNew(draftId) opens a copy of the draft (Thunderbird's "edit as new": recipients,
+ * body, attachments and References are kept), so saving writes a new draft with a new id. The
+ * original is then moved to the trash. Only messages in a Drafts folder can be edited, which is
+ * what lets the bridge allow this at policy "draft".
+ */
+/** true if the draft has no HTML body, null if that cannot be read (default editor then). */
+async function isPlainTextDraft(draftId) {
+  try {
+    return extractParts(await messenger.messages.getFull(draftId)).html === "";
+  } catch {
+    return null;
+  }
+}
+
+async function editDraft(b) {
+  const { draftId, send = false, open = false } = b;
+  if (draftId == null) throw new Error("draftId is required");
+  const draft = await messenger.messages.get(draftId);
+  if (!draft) throw new Error(`Message ${draftId} not found`);
+  if (!isDraft(draft)) throw new Error(`Message ${draftId} is not in a Drafts folder; only drafts can be edited.`);
+  const files = decodeAttachments(b.attachments);
+  if (b.removeAttachments != null &&
+      (!Array.isArray(b.removeAttachments) || b.removeAttachments.some((n) => typeof n !== "string"))) {
+    throw new Error("removeAttachments must be an array of attachment names");
+  }
+  const remove = [...new Set(b.removeAttachments || [])];
+
+  const details = {};
+  if (b.to !== undefined) details.to = recipientList(b.to);
+  if (b.cc !== undefined) details.cc = recipientList(b.cc);
+  if (b.bcc !== undefined) details.bcc = recipientList(b.bcc);
+  if (b.subject !== undefined) details.subject = b.subject;
+  if (b.identityId) details.identityId = b.identityId;
+  // Thunderbird reopens a draft in the default editor, which turned plain-text drafts into
+  // HTML. Keep the draft's format; only an explicit HTML body makes it HTML.
+  const plain = b.isHTML ? false : await isPlainTextDraft(draftId);
+  if (plain != null) details.isPlainText = plain;
+  if (b.body !== undefined) {
+    // Given in both formats: Thunderbird uses the one that matches the editor.
+    if (b.isHTML) { details.body = b.body; details.plainTextBody = htmlToPlain(b.body); }
+    else { details.plainTextBody = b.body; details.body = plainToHtml(b.body); }
+  }
+
+  const tab = await messenger.compose.beginNew(draftId, details);
+  const prepare = remove.length ? (t) => removeComposeAttachments(t.id, remove, draftId) : null;
+  const result = await finishCompose(tab, { send, open, files, prepare, listAll: true });
+  result.replacedDraftId = draftId;
+  if (open) {
+    result.note = "The original draft stays until the edited copy is saved in Thunderbird; delete it afterwards.";
+    return result;
+  }
+  try {
+    await deleteToTrash([draftId], { draftsOnly: true });
+    result.originalDraftDeleted = true;
+  } catch (e) {
+    result.originalDraftDeleted = false;
+    result.warning = `The edited draft was saved, but the original could not be moved to the trash: ${e.message}`;
+  }
+  return result;
 }
 
 function filterBulkMessages(messages, filters) {

@@ -2,9 +2,9 @@
  * HTTP client for Thunderbird CLI Bridge
  */
 
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, statSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { basename, join, resolve } from "path";
 
 // Config file paths — check both locations
 // TB_CONFIG_PATH points all three parts (bridge, tb, tb-mcp) at one file, e.g. for tests.
@@ -91,6 +91,32 @@ export async function api(method, path, body = null, timeout = 30000) {
 
 export function getConfig() {
   return config;
+}
+
+// Total size of files one message may carry (mail providers reject larger messages; the bytes
+// travel base64-encoded through the bridge, whose body limit is 32 MiB by default).
+export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Local files to attach, as [{ name, data: base64 }]. The Thunderbird extension cannot open file
+ * paths, so the file is read here, where it lies. Relative paths resolve against the current
+ * directory.
+ */
+export function readAttachmentFiles(paths) {
+  if (!paths?.length) return undefined;
+  const fail = (message, code = "INVALID_ARGS") => { throw Object.assign(new Error(message), { code }); };
+  const files = paths.map((p) => {
+    const path = resolve(p.replace(/^~(?=$|[\\/])/, homedir()));
+    let st;
+    try { st = statSync(path); } catch { fail(`Attachment not found: ${path}`, "NOT_FOUND"); }
+    if (!st.isFile()) fail(`Attachment is not a file: ${path}`);
+    return { path, size: st.size };
+  });
+  const total = files.reduce((n, f) => n + f.size, 0);
+  if (total > MAX_UPLOAD_BYTES) {
+    fail(`Attachments total ${(total / 1048576).toFixed(1)} MB; the limit is ${MAX_UPLOAD_BYTES / 1048576} MB per message.`);
+  }
+  return files.map(({ path }) => ({ name: basename(path), data: readFileSync(path).toString("base64") }));
 }
 
 // ─── Output Transformations ────────────────────────────────────────

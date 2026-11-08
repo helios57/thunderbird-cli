@@ -7,9 +7,17 @@
  *
  * Levels (each includes the ones before it):
  *   read      search, list, read, threads, attachments, stats, contacts, sync — no changes
- *   draft     + compose / reply / forward saved as a draft or opened for a human (never sent)
- *   organize  + mark read/flagged/junk, tags, move, copy, archive, create/rename folders
- *   full      + send immediately, delete messages and folders, bulk delete
+ *   draft     + compose / reply / forward (with attachments) saved as a draft or opened for a
+ *               human (never sent); edit drafts; move drafts to the trash
+ *   organize  + mark read/flagged/junk, tags, move, copy, archive, move any mail to the trash,
+ *               create/rename folders
+ *   full      + send immediately, delete permanently, delete folders, bulk delete
+ *
+ * "Trash" deletes (/messages/trash) are a move to the account's Trash folder, so they stay
+ * recoverable; the extension enforces that, and that drafts-only deletes and draft edits touch
+ * nothing outside a Drafts folder. These live on their own routes rather than as flags on
+ * /messages/delete: an older extension answers "Not found" to an unknown route, whereas it would
+ * ignore an unknown flag and delete whatever it was given.
  */
 
 export const POLICY_LEVELS = ["read", "draft", "organize", "full"];
@@ -30,7 +38,10 @@ const READ_POST = new Set([
 ]);
 const READ_POST_PATTERNS = [/^\/messages\/\d+\/attachment$/];
 
-const COMPOSE_POST = new Set(["/compose", "/reply", "/forward"]);
+// Compose routes, including editing a saved draft, need "full" only to send.
+const COMPOSE_POST = new Set(["/compose", "/reply", "/forward", "/drafts/update"]);
+// Move to the account's Trash: drafts only at "draft", any mail at "organize".
+const TRASH_POST = "/messages/trash";
 
 const ORGANIZE_POST = new Set([
   "/messages/archive",
@@ -60,8 +71,10 @@ export function requiredLevel(method, path, body) {
   if (m !== "POST") return "full";
   if (READ_POST.has(route) || READ_POST_PATTERNS.some((re) => re.test(route))) return "read";
   if (COMPOSE_POST.has(route)) return body?.send ? "full" : "draft";
+  if (route === TRASH_POST) return body?.draftsOnly ? "draft" : "organize";
   if (ORGANIZE_POST.has(route)) return "organize";
-  // Delete routes and anything not listed above (new routes stay locked until classified).
+  // /messages/delete, folder/bulk deletes and anything not listed above (new routes stay locked
+  // until classified).
   return "full";
 }
 
@@ -69,11 +82,20 @@ export function requiredLevel(method, path, body) {
 export function checkPolicy(policy, method, path, body) {
   const needed = requiredLevel(method, path, body);
   if (POLICY_LEVELS.indexOf(policy) >= POLICY_LEVELS.indexOf(needed)) return null;
-  const what = needed === "full" && COMPOSE_POST.has(String(path).split("?")[0])
-    ? "Sending immediately"
-    : `${method} ${path}`;
-  return `${what} needs bridge policy "${needed}", but it is "${policy}". ` +
-    (needed === "full" && COMPOSE_POST.has(String(path).split("?")[0])
-      ? "Save it as a draft instead (omit send), or ask the human to raise TB_BRIDGE_POLICY."
-      : "Ask the human to raise TB_BRIDGE_POLICY if this is intended.");
+  const route = String(path).split("?")[0];
+  const raise = "ask the human to raise TB_BRIDGE_POLICY if this is intended.";
+  if (needed === "full" && COMPOSE_POST.has(route)) {
+    return `Sending immediately needs bridge policy "full", but it is "${policy}". ` +
+      `Save it as a draft instead (omit send), or ${raise}`;
+  }
+  if (route === TRASH_POST && !body?.draftsOnly) {
+    return `Moving mail other than drafts to the trash needs bridge policy "organize", but it is "${policy}". ` +
+      `Drafts can be deleted at "draft"; for other mail ${raise}`;
+  }
+  if (route === "/messages/delete") {
+    return `Deleting permanently needs bridge policy "full", but it is "${policy}". ` +
+      `Move the messages to the trash instead (/messages/trash), or ${raise}`;
+  }
+  return `${method} ${path} needs bridge policy "${needed}", but it is "${policy}". ` +
+    raise.charAt(0).toUpperCase() + raise.slice(1);
 }

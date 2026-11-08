@@ -10,7 +10,7 @@ Four published artifacts, one architecture:
 
 | Artifact | What | Where |
 |---|---|---|
-| `thunderbird-cli` | `tb` CLI (38 commands) | `cli/` → npm: `thunderbird-cli` |
+| `thunderbird-cli` | `tb` CLI (39 commands) | `cli/` → npm: `thunderbird-cli` |
 | `thunderbird-cli-bridge` | Stateless HTTP↔WS proxy daemon | `bridge/` → npm: `thunderbird-cli-bridge` |
 | `thunderbird-cli-mcp` | MCP server (12 tools for Claude Desktop) | `mcp/` → npm: `thunderbird-cli-mcp` |
 | Thunderbird WebExtension | WS client inside Thunderbird | `extension/` → XPI distributed via addons.thunderbird.net (no embedded signature) |
@@ -62,6 +62,8 @@ These are defaults the end-user agent relies on. Don't flip them:
 - `email_search` excludes junk unless `include_junk: true` is explicit
 - `email_compose` / `email_reply` / `email_forward` default to `mode: "draft"`
 - `email_archive operation=delete` requires `permanent=true` AND `confirm=true` for permanent deletion
+- Non-permanent deletes are a move to the account's Trash (never `messages.delete(ids, false)`, which can delete for good depending on account settings); that is what lets the bridge allow them below `full`
+- Bridge policy: deleting/editing drafts needs `draft` (the extension checks the Drafts folder), other trash moves `organize`, send and permanent delete `full`
 - CLI bulk ops (`tb bulk delete`, `tb folder-delete`) require `--confirm`
 
 See `SECURITY.md` for the full threat model.
@@ -129,7 +131,7 @@ npm publish is manual (`cd cli && npm publish`) — intentionally, so a release 
 | `SPEC.md` | Full technical specification — source of truth for tool surface |
 | `SECURITY.md` | Threat model, CLI defenses, agent patterns |
 | `docs/SETUP.md` | User install guide |
-| `docs/COMMANDS.md` | All 38 CLI commands reference |
+| `docs/COMMANDS.md` | All 39 CLI commands reference |
 | `docs/CLAUDE.md` | Claude Code–focused CLI quick-ref (end-user oriented) |
 | `docs/distribution-log.md` | Launch venue submission tracker |
 | `skills/thunderbird-cli/SKILL.md` | End-user Claude skill (separate from this file) |
@@ -142,7 +144,7 @@ Don't propose these without discussing first:
 - **Server-side filtering logic.** Thunderbird is source of truth; we don't reimplement IMAP filter semantics.
 - **Cloud deployment.** Bridge is localhost-only by design. No remote auth, no TLS, no tunnels.
 - **New credential flow.** We never touch user email credentials. If a feature needs OAuth, it doesn't belong here.
-- **Breaking the CLI ↔ MCP symmetry.** CLI is the superset (38 cmds); MCP is the curated 12-tool subset. When adding a bulk op, CLI-only is the correct choice — don't expose it as an MCP tool unless it's individually-scoped.
+- **Breaking the CLI ↔ MCP symmetry.** CLI is the superset (39 cmds); MCP is the curated 12-tool subset. When adding a bulk op, CLI-only is the correct choice — don't expose it as an MCP tool unless it's individually-scoped.
 
 ## Questions / weirdness
 

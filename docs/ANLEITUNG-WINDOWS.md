@@ -40,7 +40,7 @@ Das Skript
    sofort gestartet,
 4. trägt den MCP-Server in Claude Code ein (`claude mcp add --scope user thunderbird ...`) und
    kopiert die Skill nach `%USERPROFILE%\.claude\skills\thunderbird-cli`,
-5. baut das Add-on: `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.5.xpi`.
+5. baut das Add-on: `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.7.xpi`.
 
 Erneut ausführen ist unbedenklich. Das Token bleibt, die Stufe wird übernommen, die Bridge neu
 gestartet.
@@ -49,7 +49,7 @@ gestartet.
 
 1. Thunderbird → Menü → **Add-ons und Themes** (`Ctrl+Shift+A`)
 2. Zahnrad oben → **Add-on aus Datei installieren…**
-3. `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.5.xpi` wählen
+3. `C:\workspace\thunderbird\dist\thunderbird-cli-2.1.1.7.xpi` wählen
 4. Die Berechtigungen (Konten und Nachrichten lesen, verfassen, verschieben …) bestätigen
 
 Das Add-on verbindet sich innerhalb von höchstens 15 Sekunden mit der Bridge.
@@ -76,10 +76,15 @@ im Bypass-Modus vor einem Tool-Aufruf nicht nachfragt.
 
 | Stufe | Erlaubt | Nicht erlaubt |
 |---|---|---|
-| `read` | suchen, lesen, Threads, Anhänge, Statistik, Kontakte | jede Änderung |
-| `draft` (Standard) | dazu: Entwürfe erstellen, Antwort/Weiterleitung als Entwurf oder im Fenster öffnen | senden, löschen, verschieben, markieren |
-| `organize` | dazu: gelesen/markiert/Junk setzen, Tags, verschieben, archivieren, Ordner anlegen/umbenennen | senden, löschen |
-| `full` | alles, auch sofort senden und löschen | – |
+| `read` | suchen, lesen, Threads, Anhänge herunterladen, Statistik, Kontakte | jede Änderung |
+| `draft` (Standard) | dazu: Entwürfe erstellen (auch mit Anhängen), Entwürfe bearbeiten, Entwürfe in den Papierkorb, Antwort/Weiterleitung als Entwurf oder im Fenster öffnen | senden, andere Mails löschen, verschieben, markieren |
+| `organize` | dazu: gelesen/markiert/Junk setzen, Tags, verschieben, archivieren, jede Mail in den Papierkorb, Ordner anlegen/umbenennen | senden, endgültig löschen |
+| `full` | alles, auch sofort senden und endgültig löschen | – |
+
+«Löschen» heisst immer: in den Papierkorb des Kontos verschieben. Das lässt sich rückgängig
+machen, auch wenn ein IMAP-Konto in Thunderbird auf «sofort löschen» eingestellt ist. Mails,
+die schon im Papierkorb liegen, bleiben dort; sie daraus zu entfernen ist endgültig und braucht
+`full`.
 
 Stufe wechseln:
 
@@ -102,8 +107,16 @@ Abgelehnte Aufrufe enden mit `POLICY_DENIED` und erreichen Thunderbird nie.
   lokal liegen: Konten-Einstellungen → *Synchronisation & Speicherplatz* → *Nachrichten für
   dieses Konto auf diesem Computer bereithalten*. Sonst muss Thunderbird jede Mail erst vom
   Server holen.
-- **Anhänge** landen in `%TEMP%\thunderbird-cli\attachments`; Claude bekommt nur den Pfad und
-  kann PDFs und Bilder von dort lesen.
+- **Anhänge herunterladen** landen in `%TEMP%\thunderbird-cli\attachments`; Claude bekommt nur
+  den Pfad und kann PDFs und Bilder von dort lesen. Ohne `partName` werden alle Anhänge einer
+  Mail gespeichert.
+- **Anhänge anfügen:** `email_compose`, `email_reply` und `email_forward` nehmen `attachments`
+  mit absoluten Dateipfaden. Die Datei wird an ihrem Ort gelesen, es braucht keine Kopie. Das
+  Add-on darf keine Dateipfade öffnen, darum schickt der MCP-Server den Inhalt über die Bridge.
+  Höchstens 20 MB pro Mail.
+- **Entwürfe bearbeiten:** `email_compose` mit `draftId` ändert nur die angegebenen Felder und
+  fügt Anhänge hinzu oder entfernt sie (`removeAttachments`). Thunderbird speichert den
+  bearbeiteten Entwurf unter einer neuen ID, der alte kommt in den Papierkorb.
 
 ## Betrieb
 
@@ -132,7 +145,11 @@ Danach das Add-on in Thunderbird entfernen.
 - **Daten an Anthropic:** Was Claude liest, geht als Kontext an die Claude-API. Das ist der
   Zweck des Ganzen, gilt aber auch für Arzt-, Steuer- und Bankmails.
 - **Prompt-Injection:** Mails können Anweisungen an eine KI enthalten. Die Stufe `draft`
-  begrenzt den möglichen Schaden: kein Senden, kein Löschen.
+  begrenzt den möglichen Schaden: kein Senden, und gelöscht werden nur Entwürfe, in den
+  Papierkorb.
+- **Lokale Dateien:** Mit `attachments` kann Claude jede Datei anhängen, die du lesen darfst.
+  Bei `draft` landet sie nur in einem Entwurf (der auf dem IMAP-Server liegt). Bei `full` könnte
+  eine untergeschobene Anweisung Dateien per Mail hinausschicken.
 - **Lokaler Zugriff:** Die Bridge lauscht nur auf `127.0.0.1` und verlangt das Token. Anfragen
   aus Webseiten im Browser werden abgewiesen.
 - **Restrisiko:** Das Add-on prüft nicht, mit wem es spricht. Läuft die Bridge nicht, könnte

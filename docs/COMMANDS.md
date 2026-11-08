@@ -1,6 +1,6 @@
 # CLI Command Reference
 
-All 38 commands in the `tb` CLI. For the quick tour, see the [main README](../README.md). For AI-agent-focused usage, see [CLAUDE.md](CLAUDE.md).
+All 39 commands in the `tb` CLI. For the quick tour, see the [main README](../README.md). For AI-agent-focused usage, see [CLAUDE.md](CLAUDE.md).
 
 ## Global Options
 
@@ -120,8 +120,9 @@ tb recent [options]
 ```bash
 tb move <messageIds> <folderId>               # move (comma-separated IDs)
 tb copy <messageIds> <folderId>               # copy
-tb delete <messageIds>                        # delete (to trash)
-tb delete <messageIds> --permanent --confirm  # permanent delete
+tb delete <messageIds>                        # move to the account's Trash (drafts: policy draft, other mail: organize)
+tb delete <messageIds> --drafts-only          # only drafts; other ids are reported, untouched
+tb delete <messageIds> --permanent --confirm  # permanent delete (policy full)
 tb archive <messageIds>                       # archive
 ```
 
@@ -156,7 +157,8 @@ tb compose [options]
   --html                   # treat body as HTML
   --from <identityId>      # send from specific identity (see: tb identities)
   --priority <level>       # highest | high | normal | low | lowest
-  --draft                  # save as draft (default)
+  --attach <path>          # attach a local file (repeatable, at most 20 MB per message)
+  --draft                  # save as draft (default; the result has its draftId)
   --open                   # open in Thunderbird compose window
   --send                   # send immediately
 
@@ -164,13 +166,28 @@ tb reply <messageId> [options]
   --body <text>            # reply text
   --body-file <path>       # read from file
   --all                    # reply to all
+  --attach <path>          # attach a local file (repeatable)
   --draft / --open / --send
 
 tb forward <messageId> [options]
   --to <address>           # required
   --body <text>            # additional text
+  --attach <path>          # attach a local file (repeatable)
   --draft / --open / --send
+
+tb draft-edit <draftId> [options]   # edit a saved draft; only the given fields change
+  --to / --cc / --bcc <address>     # replace recipients
+  --subject <text>                  # replace subject
+  --body <text> / --body-file <p>   # replace the whole body (--html for HTML)
+  --from <identityId>               # other sender identity
+  --attach <path>                   # add a file (repeatable)
+  --remove-attachment <name>        # remove an attachment by file name (repeatable)
+  --open / --send                   # instead of saving
+# Saved under a new draftId; the old draft goes to the trash (kept with --open).
 ```
+
+Attached files are read where they lie and sent to Thunderbird through the bridge (the
+extension cannot open file paths itself).
 
 ## Attachments
 
@@ -178,6 +195,7 @@ tb forward <messageId> [options]
 tb attachments <messageId>                                     # list attachments
 tb attachment-download <messageId> <partName> --output <path>  # download one
 tb attachment-download <messageId> --all --output-dir <dir>    # download all
+# Attach files: --attach on compose / reply / forward / draft-edit
 ```
 
 ## Fetch & Sync

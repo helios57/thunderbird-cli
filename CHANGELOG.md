@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Thunderbird extension 2.1.1.7 (install the new XPI; the bridge needs a restart for the new policy rules).
+
+### Added
+- **Attach local files** to new mails, replies and forwards: MCP `attachments` (absolute paths) on `email_compose` / `email_reply` / `email_forward`, CLI `--attach <path>` (repeatable). A pure WebExtension cannot open file paths, so the MCP server / CLI reads each file where it lies and passes the bytes through the bridge; the extension adds them with `compose.addAttachment()`. At most 20 MB per message. If attaching fails, the compose window is closed unsaved.
+- **Edit saved drafts** (`POST /drafts/update`): MCP `email_compose` with `draftId`, CLI `tb draft-edit <draftId>`. Only the given fields change (to/cc/bcc/subject/body), `attachments` are added, `removeAttachments` removes by file name. Thunderbird opens drafts "as new" (`compose.beginNew(draftId)`, checked in the Thunderbird 159 source: recipients, body, attachments and References carry over), so the edited draft is saved under a new id and the old one is moved to the trash. The draft keeps its format: Thunderbird reopens drafts in the account's default editor, which would turn a plain-text draft into HTML, so the extension passes the original format (an explicit HTML body makes it HTML). The result lists every attachment the edited draft has. Only messages in a Drafts folder can be edited.
+- **Delete drafts at policy `draft`**: new route `POST /messages/trash` moves messages to the account's Trash (policy `organize`); with `draftsOnly: true` it moves only drafts and returns the other ids in `notDrafts`, untouched (policy `draft`). `email_archive operation=delete` and `tb delete` try drafts first, then the rest, and say which ids were refused. New routes rather than flags on `/messages/delete`, so an older add-on answers "Not found" instead of ignoring the flag and deleting anything; the MCP server turns that into "install the current add-on", and reports it when an older add-on saved a mail without the requested attachments.
+- Compose, reply and forward return the saved draft's `draftId`.
+- `email_attachments operation=download` without `partName` saves every attachment of the message.
+
+### Changed
+- **Delete means "move to the account's Trash".** `messages.delete()` without skipTrash follows the account's deletion setting, so an IMAP account set to "remove immediately" deleted for good, and deleting inside Trash is always permanent. Deletes now move to the Trash folder explicitly; messages already in Trash are left there (`alreadyInTrash`), and an account without a Trash folder fails the request before anything moves.
+- **Policy:** moving mail to the trash needs `organize` (it is a move, which `organize` already allowed); deleting drafts needs only `draft`; `/messages/delete` (permanent) still needs `full`. Editing a draft needs `draft`, sending the edited draft `full`. Denials name the allowed alternative.
+- The bridge accepts request bodies up to 32 MiB by default (was 10 MiB), room for 20 MB of base64-encoded attachments.
+
+### Fixed
+- **Windows: restarting the bridge task restarts the bridge.** `Stop-ScheduledTask` ends only the PowerShell wrapper; node kept running with the old code and held the ports and the log file, so the new start failed. `start-bridge.ps1` now stops a leftover bridge process before it starts.
+
 ## [fork 1.1.1+hardening] — 2026-10-31
 
 Fork `helios57/thunderbird-cli`, on top of upstream PR #26 (1.1.1). Thunderbird extension 2.1.1.1.

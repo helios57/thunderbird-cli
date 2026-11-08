@@ -15,13 +15,15 @@ import { fileURLToPath } from "url";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "cli", "src", "cli.js");
 const deleteCalls = [];
+const composeCalls = [];
+let addonVersion = "2.1.1.7";
 
 const PORT = 19700;
 const WS_PORT = 19701;
 let passed = 0, failed = 0;
 
 function handle({ method, path, body }) {
-  if (path === "/health") return { status: "ok", version: "2.0.0", thunderbird: true };
+  if (path === "/health") return { status: "ok", version: addonVersion, thunderbird: true };
   if (path === "/accounts") return [{ id: "acct1", name: "Test", type: "imap", identities: [{ id: "id1", email: "t@t.com", name: "T" }], rootFolder: { id: "rf", name: "" } }];
   if (path?.match(/^\/accounts\/[^/]+$/) && method === "GET") return { id: "acct1", name: "Test" };
   if (path?.match(/^\/accounts\/[^/]+\/folders$/)) return [{ id: "f1", name: "Inbox", path: "/Inbox", type: "inbox", depth: 0, unreadMessageCount: 5, totalMessageCount: 50 }];
@@ -37,7 +39,10 @@ function handle({ method, path, body }) {
   if (path === "/messages/archive") return { success: true, archived: (body?.messageIds || []).length };
   if (path === "/messages/move") return { success: true, moved: (body?.messageIds || []).length };
   if (path === "/messages/copy") return { success: true, copied: (body?.messageIds || []).length };
-  if (path === "/messages/delete") return { success: true, deleted: (body?.messageIds || []).length };
+  if (path === "/messages/delete") { deleteCalls.push({ ...body, route: "delete" }); return { success: true, deleted: (body?.messageIds || []).length }; }
+  if (path === "/messages/trash" && (body?.messageIds || []).includes(999)) {
+    return { error: "Not found: POST /messages/trash" }; // an add-on without the route
+  }
   if (path === "/messages/trash") {
     deleteCalls.push(body);
     const ids = body?.messageIds || [];
@@ -60,6 +65,7 @@ function handle({ method, path, body }) {
   if (path === "/tags") return [{ key: "$l1", tag: "Important", color: "#FF0000" }];
   if (path === "/tags/create") return { success: true, ...body };
   if (path === "/drafts/update") return { success: true, action: "draft_saved", draftId: 901, _body: body };
+  if (path === "/compose") composeCalls.push(body);
   if (path === "/compose") return { success: true, action: body?.send ? "sent" : body?.open ? "draft_opened" : "draft_saved", _body: body };
   if (path === "/reply") return { success: true, action: body?.send ? "sent" : "draft_saved", _body: body };
   if (path === "/forward") return { success: true, action: body?.send ? "sent" : "draft_saved", _body: body };
@@ -251,6 +257,21 @@ deleteCalls.length = 0;
 const delDrafts = await tb("delete", "501,1", "--drafts-only");
 test("tb delete --drafts-only leaves other mail alone", delDrafts.json, r =>
   r?.ok && r.data.deleted === 1 && JSON.stringify(r.data.notDrafts) === "[1]" && deleteCalls.length === 1);
+deleteCalls.length = 0;
+const permDrafts = await tb("delete", "501,1", "--drafts-only", "--permanent", "--confirm");
+test("tb delete --drafts-only --permanent is refused, nothing deleted", permDrafts, r =>
+  r.code === 1 && r.json?.code === "INVALID_ARGS" && deleteCalls.length === 0);
+const oldRoute = await tb("delete", "999");
+test("tb delete with an add-on without the trash route says so and fails", oldRoute, r =>
+  r.code === 1 && r.json?.code === "THUNDERBIRD_ERROR" && /older than 2\.1\.1\.7/.test(r.json?.error));
+addonVersion = "2.1.1.5";
+composeCalls.length = 0;
+const oldAttach = await tb("compose", "--to", "x@y.z", "--body", "Hi", "--attach", fileA, "--send");
+test("tb compose --attach with an add-on too old for it stops before sending", oldAttach, r =>
+  r.code === 1 && /older than 2\.1\.1\.7.*Nothing was saved or sent/.test(r.json?.error) && composeCalls.length === 0);
+const oldPlain = await tb("compose", "--to", "x@y.z", "--body", "Hi");
+test("…mail without attachments still works with it", oldPlain.json, r => r?.ok && composeCalls.length === 1);
+addonVersion = "2.1.1.7";
 rmSync(upDir, { recursive: true, force: true });
 
 console.log(`\n\x1b[1m${"─".repeat(40)}\x1b[0m`);

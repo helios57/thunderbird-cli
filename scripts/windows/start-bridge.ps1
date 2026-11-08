@@ -16,13 +16,17 @@ $logDir = Join-Path $env:LOCALAPPDATA "thunderbird-cli"
 New-Item -ItemType Directory -Force $logDir | Out-Null
 
 # Stop-ScheduledTask ends this wrapper but not node: a bridge from an earlier start keeps the
-# ports and its log file open, so this start would fail and the old code keep running.
-Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-  Where-Object { $_.CommandLine -like "*bridge\bridge.js*" } |
-  ForEach-Object {
-    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-    Wait-Process -Id $_.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+# ports and its log file open, so this start would fail and the old code keep running. Stop the
+# bridge that holds the ports (however it was started), and nothing else.
+$holders = Get-NetTCPConnection -LocalPort 7700, 7701 -State Listen -ErrorAction SilentlyContinue |
+  Select-Object -ExpandProperty OwningProcess -Unique
+foreach ($id in $holders) {
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$id"
+  if ($p.Name -eq "node.exe" -and $p.CommandLine -match "bridge[\\/]bridge\.js") {
+    Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+    Wait-Process -Id $id -Timeout 10 -ErrorAction SilentlyContinue
   }
+}
 
 $out = Join-Path $logDir "bridge.log"
 $err = Join-Path $logDir "bridge.err.log"

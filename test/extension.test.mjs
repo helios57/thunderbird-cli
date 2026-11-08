@@ -136,7 +136,11 @@ const messenger = {
   },
   tabs: { remove: async (tabId) => { composeTabs.get(tabId).closed = true; } },
   idle: { onStateChanged: { addListener: (fn) => idleListeners.push(fn) } },
-  folders: { get: async (id) => ({ id, accountId: "acct1" }) },
+  folders: {
+    get: async (id) => ({ id, accountId: "acct1" }),
+    query: async ({ accountId, specialUse }) =>
+      (accountId === "noTrash" || !specialUse?.includes("trash") ? [] : [trashFolder(accountId)]),
+  },
   messages: {
     get: (id) => track(async () => {
       if (!store.has(id)) throw new Error(`Message ${id} not found`);
@@ -376,6 +380,14 @@ calls.getRaw.length = 0;
 store.get(7).raw = undefined;
 const fetched = await handle("POST", "/bulk/fetch", { folderId: "f1", limit: 100 });
 test("bulk fetch counts successes", fetched.fetched === 39 && fetched.total === 40);
+
+calls.move.length = 0; calls.delete.length = 0;
+const bulkDel = await handle("POST", "/bulk/delete", { folderId: "f1", limit: 100, subject: "nomatch-" });
+test("bulk delete without matches does nothing", bulkDel.deleted === 0 && calls.move.length === 0);
+for (let i = 1; i <= 3; i++) store.get(i).header.folder = { accountId: "acct1", path: "/INBOX", name: "Inbox", specialUse: ["inbox"] };
+const bulkTrash = await handle("POST", "/bulk/delete", { folderId: "f1", limit: 3 });
+test("bulk delete moves to the trash, never messages.delete", bulkTrash.movedTo === "trash" && bulkTrash.deleted === 3 &&
+  calls.move.length === 1 && calls.move[0].folder.id === "acct1://Trash" && calls.delete.length === 0, JSON.stringify(bulkTrash));
 
 // ─── List sorting (#24, #15) ────────────────────────────────────────
 
@@ -639,6 +651,12 @@ let missingDel = null;
 try { await handle("POST", "/messages/trash", { messageIds: [301, 9999] }); } catch (e) { missingDel = e; }
 test("an unknown id fails the request before anything moves", !!missingDel && calls.move.length === 0);
 
+store.get(301).header.folder = inbox;
+calls.move.length = 0;
+const twice = await handle("POST", "/messages/trash", { messageIds: [301, 301] });
+test("a repeated id is moved and counted once", twice.deleted === 1 && JSON.stringify(calls.move[0]?.ids) === "[301]", JSON.stringify(calls.move));
+store.get(301).header.folder = inbox;
+
 const perm = await handle("POST", "/messages/delete", { messageIds: [301], permanent: true });
 test("permanent delete uses messages.delete(ids, true)", perm.permanent === true && calls.delete.length === 1 && calls.delete[0].permanent === true);
 test("delete without ids is an error", !!(await handle("POST", "/messages/trash", { messageIds: [] })).error);
@@ -652,12 +670,16 @@ test("/messages/delete without permanent also moves to the trash", legacyDel.mov
 console.log("\n\x1b[1mCompose with attachments\x1b[0m");
 const pdf = { name: "Rechnung.pdf", data: Buffer.from("%PDF-1.4 test").toString("base64") };
 const odd = { name: "notes.weird", data: Buffer.from("x").toString("base64") };
+const protoName = { name: "notes.constructor", data: Buffer.from("x").toString("base64") };
 const composed = await handle("POST", "/compose", { to: "a@b.c", subject: "S", body: "B", attachments: [pdf, odd] });
 const ctab = composeTabs.get(calls.compose.at(-1).id);
 test("compose saves a draft and returns its id", composed.action === "draft_saved" && typeof composed.draftId === "number" && ctab.saved && ctab.closed);
 test("compose attaches each file", composed.attachments?.length === 2 && ctab.attachments.map((a) => a.name).join() === "Rechnung.pdf,notes.weird");
 test("attachment bytes arrive intact", Buffer.from(await ctab.attachments[0].file.arrayBuffer()).toString() === "%PDF-1.4 test");
 test("content type is guessed from the name", ctab.attachments[0].file.type === "application/pdf" && ctab.attachments[1].file.type === "");
+await handle("POST", "/compose", { to: "a@b.c", body: "B", attachments: [protoName] });
+const ptab = composeTabs.get(calls.compose.at(-1).id);
+test("a name like .constructor gets no made-up content type", ptab.attachments[0].file.type === "", ptab.attachments[0].file.type);
 
 const before = composeTabs.size;
 let badB64 = null;
@@ -744,6 +766,28 @@ test("an unreadable draft body leaves the format to Thunderbird", !("isPlainText
 store.set(318, { header: header(318, { folder: draftsFolder() }), attachmentNames: ["a.pdf"] });
 const stripped = await handle("POST", "/drafts/update", { draftId: 318, removeAttachments: ["a.pdf"] });
 test("removing the last attachment reports an empty list", Array.isArray(stripped.attachments) && stripped.attachments.length === 0, JSON.stringify(stripped.attachments));
+
+const encrypted = { contentType: "multipart/encrypted", headers: {}, parts: [
+  { contentType: "application/pgp-encrypted", partName: "1.1", headers: {} },
+  { contentType: "application/octet-stream", partName: "1.2", headers: {} },
+] };
+store.set(319, { header: header(319, { folder: draftsFolder() }), full: encrypted });
+await handle("POST", "/drafts/update", { draftId: 319, subject: "x" });
+test("an encrypted draft leaves the format to Thunderbird", !("isPlainText" in composeTabs.get(calls.compose.at(-1).id).details));
+
+store.set(320, { header: header(320, { folder: draftsFolder() }), attachmentNames: ["a.pdf"] });
+await handle("POST", "/drafts/update", { draftId: 320, subject: "neu", to: null, cc: null, body: null });
+const ntab = composeTabs.get(calls.compose.at(-1).id);
+test("null fields count as not given", ntab.details.subject === "neu" && !("to" in ntab.details) && !("cc" in ntab.details) &&
+  !("body" in ntab.details) && !("plainTextBody" in ntab.details), JSON.stringify(ntab.details));
+
+// The original leaves Drafts while the edit runs (a filter, the human): it must not be reported as deleted.
+let reads321 = 0;
+store.set(321, { get header() { return header(321, { folder: reads321++ === 0 ? draftsFolder() : inbox }); } });
+calls.move.length = 0;
+const moved = await handle("POST", "/drafts/update", { draftId: 321, subject: "x" });
+test("an original that left Drafts is not reported as deleted", moved.originalDraftDeleted === false && /no longer in a Drafts folder/.test(moved.warning) &&
+  calls.move.length === 0, JSON.stringify(moved));
 
 console.log(`\n\x1b[1m${"─".repeat(40)}\x1b[0m`);
 console.log(`\x1b[1m${passed} passed, ${failed} failed, ${passed + failed} total\x1b[0m\n`);

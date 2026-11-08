@@ -24,6 +24,8 @@ const WS_PORT = 19801;
 const updates = [];
 const deletes = [];
 const DRAFT_IDS = new Set([501, 502]);
+let addonVersion = "2.1.1.7";
+const composeCalls = [];
 let passed = 0,
   failed = 0;
 const failures = [];
@@ -33,7 +35,7 @@ const failures = [];
 const attached = (body) => (body?.attachments?.length ? { attachments: body.attachments.map((a) => ({ name: a.name })) } : {});
 
 function handle({ method, path, body }) {
-  if (path === "/health") return { status: "ok", version: "2.0.0", thunderbird: true };
+  if (path === "/health") return { status: "ok", version: addonVersion, thunderbird: true };
   if (path === "/accounts" && method === "GET")
     return [
       {
@@ -157,8 +159,7 @@ function handle({ method, path, body }) {
   if (path === "/drafts/update")
     return { success: true, action: body?.send ? "sent" : "draft_saved", draftId: 901, replacedDraftId: body?.draftId,
       ...attached(body), _body: body };
-  if (path === "/compose" && body?.subject === "__old_addon__")
-    return { success: true, action: "draft_saved" }; // an add-on that ignores attachments
+  if (path === "/compose") composeCalls.push(body);
   if (path === "/compose")
     return { success: true, action: body?.send ? "sent" : body?.open ? "draft_opened" : "draft_saved", draftId: 900, ...attached(body), _body: body };
   if (path === "/reply") return { success: true, action: body?.send ? "sent" : "draft_saved", ...attached(body), _body: body };
@@ -622,7 +623,7 @@ test(
 test(
   "an add-on without the trash route gets a clear upgrade message",
   await client.callTool("email_archive", { messageIds: [999], operation: "delete" }),
-  (r) => r.code === "THUNDERBIRD_ERROR" && /older than 2\.1\.1\.6/.test(r.error)
+  (r) => r.code === "THUNDERBIRD_ERROR" && /older than 2\.1\.1\.7/.test(r.error)
 );
 
 console.log("\n\x1b[1mUpload attachments\x1b[0m");
@@ -665,10 +666,25 @@ test("email_forward attaches files", fwdFile, (r) => r._body.attachments?.length
 test("compose without attachments sends none", await client.callTool("email_compose", { to: "a@b.com", body: "x" }), (r) =>
   r._body.attachments === undefined
 );
+addonVersion = "2.1.1.5";
+composeCalls.length = 0;
 test(
-  "an add-on that ignores attachments is reported, not hidden",
-  await client.callTool("email_compose", { to: "a@b.com", subject: "__old_addon__", attachments: [pdfPath] }),
-  (r) => r.code === "THUNDERBIRD_ERROR" && /WITHOUT the attachments/.test(r.error)
+  "an add-on too old for attachments is caught before anything is sent",
+  await client.callTool("email_compose", { to: "a@b.com", body: "x", attachments: [pdfPath], mode: "send" }),
+  (r) => r.code === "THUNDERBIRD_ERROR" && /older than 2\.1\.1\.7.*Nothing was saved or sent/.test(r.error) && composeCalls.length === 0
+);
+test("…but mail without attachments still works with it", await client.callTool("email_compose", { to: "a@b.com", body: "x" }), (r) =>
+  r.action === "draft_saved" && composeCalls.length === 1
+);
+addonVersion = "2.1.10.0";
+test("a newer add-on version passes the check", await client.callTool("email_compose", { to: "a@b.com", body: "x", attachments: [pdfPath] }), (r) =>
+  r.action === "draft_saved" && r._body.attachments?.length === 1
+);
+addonVersion = "2.1.1.7";
+test(
+  "a missing `to` is reported before any file is read",
+  await client.callTool("email_compose", { body: "x", attachments: [join(UPLOAD_DIR, "nope.pdf")] }),
+  (r) => r.code === "INVALID_ARGS" && /needs `to`/.test(r.error)
 );
 test(
   "a new message without `to` is INVALID_ARGS",
@@ -683,6 +699,9 @@ const editDraft = await client.callTool("email_compose", {
 test("draft edit sends only what changes", editDraft, (r) =>
   r.draftId === 901 && r.replacedDraftId === 501 && r._body.draftId === 501 && r._body.subject === "Neu" && !("to" in r._body) && !("body" in r._body) &&
   r._body.attachments?.length === 1 && JSON.stringify(r._body.removeAttachments) === '["alt.pdf"]' && r._body.draft === true
+);
+test("null fields in a draft edit count as not given", await client.callTool("email_compose", { draftId: 501, subject: "S", to: null, body: null }), (r) =>
+  r._body.subject === "S" && !("to" in r._body) && !("body" in r._body) && !("isHTML" in r._body)
 );
 test("draft edit with a new body passes its format", await client.callTool("email_compose", { draftId: 501, body: "<p>x</p>", html: true }), (r) =>
   r._body.body === "<p>x</p>" && r._body.isHTML === true

@@ -793,10 +793,8 @@ async function handleRequest({ method, path, body }, ctx = null) {
     const folder = await messenger.folders.get(body.folderId, false);
     const result = await collectMessages(() => messenger.messages.list(folder), body.limit || 100);
     const filtered = filterBulkMessages(result.messages, body);
-    if (filtered.length > 0) {
-      await messenger.messages.delete(filtered.map((m) => m.id), false);
-    }
-    return { success: true, deleted: filtered.length };
+    if (filtered.length === 0) return { success: true, deleted: 0 };
+    return await deleteToTrash(filtered.map((m) => m.id));
   }
 
   if (path === "/bulk/tag" && method === "POST") {
@@ -845,13 +843,33 @@ function formatMessage(msg) {
   };
 }
 
+// A text/plain or text/html part that is a file (.txt, .csv, .ics, an attached .html) is an
+// attachment, not body text: concatenating it would bloat the body and hide the file.
+function isFilePart(part) {
+  const disposition = String(part.headers?.["content-disposition"]?.[0] || "").toLowerCase();
+  return !!part.name || disposition.startsWith("attachment");
+}
+
+/** true for a plain-text draft, false for HTML, null if its body has neither (encrypted) or cannot be read. */
+async function isPlainTextDraft(draftId) {
+  let full;
+  try { full = await messenger.messages.getFull(draftId); } catch { return null; }
+  let html = false, plain = false;
+  const walk = (part) => {
+    if (!part) return;
+    const ct = (part.contentType || "").toLowerCase();
+    if (ct === "text/html" && !isFilePart(part)) html = true;
+    else if (ct === "text/plain" && !isFilePart(part)) plain = true;
+    for (const sub of part.parts || []) walk(sub);
+  };
+  walk(full);
+  return html ? false : plain ? true : null;
+}
+
 function extractParts(part, result = { text: "", html: "", attachments: [] }) {
   if (!part) return result;
   const ct = (part.contentType || "").toLowerCase();
-  // A text/plain or text/html part that is a file (.txt, .csv, .ics, an attached .html) is an
-  // attachment, not body text: concatenating it would bloat the body and hide the file.
-  const disposition = String(part.headers?.["content-disposition"]?.[0] || "").toLowerCase();
-  const isFile = !!part.name || disposition.startsWith("attachment");
+  const isFile = isFilePart(part);
   if (ct === "text/plain" && part.body && !isFile) result.text += part.body;
   else if (ct === "text/html" && part.body && !isFile) result.html += part.body;
   else if (part.partName && (isFile || (ct && !ct.startsWith("multipart/")))) {
@@ -1124,15 +1142,10 @@ const isDraft = (msg) => hasSpecialUse(msg?.folder, "drafts");
 
 /** The account's Trash folder (MailFolder), or null. */
 async function findTrashFolder(accountId) {
-  const account = accountId ? await messenger.accounts.get(accountId, true) : null;
-  let found = null;
-  const walk = (folder) => {
-    if (found || !folder) return;
-    if (hasSpecialUse(folder, "trash") && !folder.isVirtual) found = folder;
-    else for (const sub of folder.subFolders || []) walk(sub);
-  };
-  walk(account?.rootFolder);
-  return found;
+  if (!accountId) return null;
+  // Asks for the one folder instead of loading the account's whole folder tree.
+  const found = await messenger.folders.query({ accountId, specialUse: ["trash"] });
+  return found.find((f) => !f.isVirtual) || null;
 }
 
 /**
@@ -1146,6 +1159,7 @@ async function findTrashFolder(accountId) {
  * a permanent delete. Every id is checked before anything moves.
  */
 async function deleteToTrash(messageIds, { draftsOnly = false } = {}) {
+  messageIds = [...new Set(messageIds)];
   const headers = await mapWithIpcLimit(messageIds, (id) => messenger.messages.get(id));
   const notDrafts = [];
   const alreadyInTrash = [];
@@ -1229,7 +1243,8 @@ function decodeAttachments(list) {
       throw new Error(`attachments[${i}] (${a.name}): data is not valid base64`);
     }
     const ext = /\.([0-9a-z]+)$/i.exec(a.name)?.[1]?.toLowerCase();
-    return new File([bytes], a.name, { type: a.contentType || ATTACHMENT_TYPES[ext] || "" });
+    const type = a.contentType || (Object.hasOwn(ATTACHMENT_TYPES, ext) ? ATTACHMENT_TYPES[ext] : "");
+    return new File([bytes], a.name, { type });
   });
 }
 
@@ -1307,15 +1322,6 @@ function htmlToPlain(html) {
  * original is then moved to the trash. Only messages in a Drafts folder can be edited, which is
  * what lets the bridge allow this at policy "draft".
  */
-/** true if the draft has no HTML body, null if that cannot be read (default editor then). */
-async function isPlainTextDraft(draftId) {
-  try {
-    return extractParts(await messenger.messages.getFull(draftId)).html === "";
-  } catch {
-    return null;
-  }
-}
-
 async function editDraft(b) {
   const { draftId, send = false, open = false } = b;
   if (draftId == null) throw new Error("draftId is required");
@@ -1329,17 +1335,19 @@ async function editDraft(b) {
   }
   const remove = [...new Set(b.removeAttachments || [])];
 
+  // null counts as "not given": some clients send it for every field they leave out, and it
+  // must not wipe the recipients or write "null" into the body.
   const details = {};
-  if (b.to !== undefined) details.to = recipientList(b.to);
-  if (b.cc !== undefined) details.cc = recipientList(b.cc);
-  if (b.bcc !== undefined) details.bcc = recipientList(b.bcc);
-  if (b.subject !== undefined) details.subject = b.subject;
+  if (b.to != null) details.to = recipientList(b.to);
+  if (b.cc != null) details.cc = recipientList(b.cc);
+  if (b.bcc != null) details.bcc = recipientList(b.bcc);
+  if (b.subject != null) details.subject = b.subject;
   if (b.identityId) details.identityId = b.identityId;
   // Thunderbird reopens a draft in the default editor, which turned plain-text drafts into
   // HTML. Keep the draft's format; only an explicit HTML body makes it HTML.
   const plain = b.isHTML ? false : await isPlainTextDraft(draftId);
   if (plain != null) details.isPlainText = plain;
-  if (b.body !== undefined) {
+  if (b.body != null) {
     // Given in both formats: Thunderbird uses the one that matches the editor.
     if (b.isHTML) { details.body = b.body; details.plainTextBody = htmlToPlain(b.body); }
     else { details.plainTextBody = b.body; details.body = plainToHtml(b.body); }
@@ -1354,8 +1362,12 @@ async function editDraft(b) {
     return result;
   }
   try {
-    await deleteToTrash([draftId], { draftsOnly: true });
-    result.originalDraftDeleted = true;
+    const moved = await deleteToTrash([draftId], { draftsOnly: true });
+    result.originalDraftDeleted = moved.deleted === 1;
+    if (!result.originalDraftDeleted) {
+      result.warning = "The edited draft was saved, but the original is no longer in a Drafts folder " +
+        "(or already in the trash) and was left where it is.";
+    }
   } catch (e) {
     result.originalDraftDeleted = false;
     result.warning = `The edited draft was saved, but the original could not be moved to the trash: ${e.message}`;

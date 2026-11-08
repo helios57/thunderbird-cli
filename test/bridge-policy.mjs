@@ -225,6 +225,16 @@ console.log("\n\x1b[1mBody limit and disconnects\x1b[0m");
   await stopBridge(proc);
 }
 
+{
+  // A multi-megabyte upload arrives in many chunks: the 413 must still reach the client
+  // (closing the socket mid-upload showed up as a connection reset instead).
+  const { proc } = await startBridge({ TB_BRIDGE_MAX_BODY_BYTES: "1000000" });
+  const upload = await call("POST", "/compose", JSON.stringify({ to: "a@b.c", attachments: [{ name: "x.bin", data: "A".repeat(2_500_000) }] }));
+  test("an oversized upload gets 413, not a connection reset", upload.status, 413);
+  test("…with PAYLOAD_TOO_LARGE", upload.json?.code, "PAYLOAD_TOO_LARGE");
+  await stopBridge(proc);
+}
+
 console.log("\n\x1b[1mTime budget and cancellation\x1b[0m");
 {
   const { proc } = await startBridge();

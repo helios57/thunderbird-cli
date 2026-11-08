@@ -224,7 +224,7 @@ tb contact <contactId>                    # contact details
 ```bash
 tb bulk mark-read <folderId> [-l <n>]                             # mark all read
 tb bulk move <from> <to> [--older-than <days>] [--from <addr>] [--subject <pat>]
-tb bulk delete <folderId> --confirm [--older-than <days>] [--from <addr>]
+tb bulk delete <folderId> --confirm [--older-than <days>] [--from <addr>]   # to the trash
 tb bulk tag <folderId> <tagKey> [--older-than <days>] [--from <addr>]
 tb bulk fetch <folderId> [-l <n>]                                 # force IMAP download
 ```

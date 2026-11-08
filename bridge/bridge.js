@@ -383,12 +383,17 @@ const httpServer = createServer(async (req, res) => {
   for await (const chunk of req) {
     size += chunk.length;
     if (size > MAX_BODY_BYTES) {
-      res.writeHead(413);
-      res.end(JSON.stringify({ error: `Request body larger than ${MAX_BODY_BYTES} bytes`, code: "PAYLOAD_TOO_LARGE" }));
-      req.destroy();
-      return;
+      // Read on without keeping the rest: closing the socket mid-upload makes the client see a
+      // connection reset instead of this answer. Past 64 MiB more than allowed, close anyway.
+      if (size > MAX_BODY_BYTES + 64 * 1024 * 1024) { req.destroy(); return; }
+      continue;
     }
     chunks.push(chunk);
+  }
+  if (size > MAX_BODY_BYTES) {
+    res.writeHead(413);
+    res.end(JSON.stringify({ error: `Request body larger than ${MAX_BODY_BYTES} bytes`, code: "PAYLOAD_TOO_LARGE" }));
+    return;
   }
   const body = Buffer.concat(chunks).toString("utf-8");
 

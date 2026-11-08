@@ -62,6 +62,38 @@ function composeTimeout(globalOpts, payload) {
   return payload.attachments?.length || payload.draftId != null ? Math.max(t, 120000) : t;
 }
 
+// First add-on with attachments on compose/reply/forward, /drafts/update and /messages/trash.
+const MIN_ADDON = "2.1.1.7";
+const OLD_ADDON = `The Thunderbird add-on is older than ${MIN_ADDON} and cannot do this yet; install the current XPI (see docs).`;
+
+function versionAtLeast(version, min) {
+  const have = String(version || "").split(".").map((n) => parseInt(n, 10) || 0);
+  const want = min.split(".").map((n) => parseInt(n, 10));
+  for (let i = 0; i < want.length; i++) {
+    if ((have[i] || 0) !== want[i]) return (have[i] || 0) > want[i];
+  }
+  return true;
+}
+
+/** An add-on that does not know a route answers { error: "Not found: ..." }. */
+function checkRouteKnown(data) {
+  if (typeof data?.error === "string" && data.error.startsWith("Not found:")) {
+    throw Object.assign(new Error(OLD_ADDON), { code: "THUNDERBIRD_ERROR" });
+  }
+  return data;
+}
+
+/** Compose, reply, forward, draft edit. An older add-on ignores attachments, so ask its version first. */
+async function composeCall(path, payload, g) {
+  if (payload.attachments?.length) {
+    const health = await api("GET", "/health", null, getTimeout(g));
+    if (!versionAtLeast(health?.version, MIN_ADDON)) {
+      throw Object.assign(new Error(`${OLD_ADDON} Nothing was saved or sent.`), { code: "THUNDERBIRD_ERROR" });
+    }
+  }
+  return checkRouteKnown(await api("POST", path, payload, composeTimeout(g, payload)));
+}
+
 function setMode(payload, opts) {
   if (opts.send) payload.send = true;
   else if (opts.open) payload.open = true;
@@ -434,6 +466,11 @@ program
       outputError({ message: "Use --confirm for permanent delete", code: "INVALID_ARGS" }, fmt);
       return;
     }
+    if (opts.permanent && opts.draftsOnly) {
+      // Permanent delete cannot tell drafts apart: it would delete every id given.
+      outputError({ message: "--drafts-only cannot be combined with --permanent", code: "INVALID_ARGS" }, fmt);
+      return;
+    }
     const ids = parseIds(messageIds);
     if (opts.permanent) {
       const data = await api("POST", "/messages/delete", { messageIds: ids, permanent: true }, timeout);
@@ -441,7 +478,7 @@ program
       return;
     }
     // Drafts first: allowed at policy "draft"; the rest needs "organize".
-    const drafts = await api("POST", "/messages/trash", { messageIds: ids, draftsOnly: true }, timeout);
+    const drafts = checkRouteKnown(await api("POST", "/messages/trash", { messageIds: ids, draftsOnly: true }, timeout));
     const rest = drafts.notDrafts || [];
     if (opts.draftsOnly || drafts.error || rest.length === 0) {
       output(drafts, fmt, getOutputOpts(g));
@@ -596,7 +633,7 @@ program
     if (attachments) payload.attachments = attachments;
     setMode(payload, opts);
 
-    const data = await api("POST", "/compose", payload, composeTimeout(g, payload));
+    const data = await composeCall("/compose", payload, g);
     output(data, g.format, getOutputOpts(g));
   }));
 
@@ -629,7 +666,7 @@ program
     if (opts.removeAttachment.length) payload.removeAttachments = opts.removeAttachment;
     setMode(payload, opts);
 
-    const data = await api("POST", "/drafts/update", payload, composeTimeout(g, payload));
+    const data = await composeCall("/drafts/update", payload, g);
     output(data, g.format, getOutputOpts(g));
   }));
 
@@ -657,7 +694,7 @@ program
     if (attachments) payload.attachments = attachments;
     setMode(payload, opts);
 
-    const data = await api("POST", "/reply", payload, composeTimeout(g, payload));
+    const data = await composeCall("/reply", payload, g);
     output(data, g.format, getOutputOpts(g));
   }));
 
@@ -683,7 +720,7 @@ program
     if (attachments) payload.attachments = attachments;
     setMode(payload, opts);
 
-    const data = await api("POST", "/forward", payload, composeTimeout(g, payload));
+    const data = await composeCall("/forward", payload, g);
     output(data, g.format, getOutputOpts(g));
   }));
 
@@ -915,7 +952,7 @@ bulk
 
 bulk
   .command("delete <folderId>")
-  .description("Bulk delete messages in folder")
+  .description("Bulk move messages in a folder to the account's Trash")
   .option("--older-than <days>", "only messages older than N days")
   .option("--from <address>", "filter by sender")
   .option("--subject <pattern>", "filter by subject")

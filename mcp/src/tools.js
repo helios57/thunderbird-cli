@@ -50,7 +50,18 @@ function applyMode(payload, mode = "draft") {
   return payload;
 }
 
-const OLD_ADDON = "The Thunderbird add-on is older than 2.1.1.6 and cannot do this yet; install the current XPI (see docs).";
+// First add-on with attachments on compose/reply/forward, /drafts/update and /messages/trash.
+const MIN_ADDON = "2.1.1.7";
+const OLD_ADDON = `The Thunderbird add-on is older than ${MIN_ADDON} and cannot do this yet; install the current XPI (see docs).`;
+
+function versionAtLeast(version, min) {
+  const have = String(version || "").split(".").map((n) => parseInt(n, 10) || 0);
+  const want = min.split(".").map((n) => parseInt(n, 10));
+  for (let i = 0; i < want.length; i++) {
+    if ((have[i] || 0) !== want[i]) return (have[i] || 0) > want[i];
+  }
+  return true;
+}
 
 /** An extension that does not know a route answers { error: "Not found: ..." }. */
 function checkRouteKnown(result) {
@@ -62,6 +73,14 @@ function checkRouteKnown(result) {
 
 /** Compose-type call with the right timeout, and a readable error when files are too big. */
 async function composeCall(api, path, payload) {
+  // An older add-on ignores `attachments` and would save, or send, the mail without them:
+  // ask for its version before anything is created.
+  if (payload.attachments?.length) {
+    const health = await api("GET", "/health");
+    if (!versionAtLeast(health?.version, MIN_ADDON)) {
+      throw Object.assign(new Error(`${OLD_ADDON} Nothing was saved or sent.`), { code: "THUNDERBIRD_ERROR" });
+    }
+  }
   const slow = payload.attachments?.length || payload.draftId != null;
   let result;
   try {
@@ -71,12 +90,6 @@ async function composeCall(api, path, payload) {
       err.message = "Attachments are larger than the bridge accepts (TB_BRIDGE_MAX_BODY_BYTES, default 32 MiB; files grow by a third in transit).";
     }
     throw err;
-  }
-  // An older add-on ignores `attachments` and saves the mail without them.
-  if (payload.attachments?.length && result?.success && !result.attachments) {
-    throw Object.assign(new Error(`The mail was saved WITHOUT the attachments (action: ${result.action}). ${OLD_ADDON}`), {
-      code: "THUNDERBIRD_ERROR",
-    });
   }
   return result;
 }
@@ -465,14 +478,15 @@ export const tools = [
       },
     },
     handler: async (args, api) => {
-      const attachments = readAttachmentFiles(args.attachments);
       if (args.draftId != null) {
+        // null counts as "not given": some clients send it for every field they leave out.
         const payload = { draftId: args.draftId };
         for (const key of ["to", "cc", "bcc", "subject", "body"]) {
-          if (args[key] !== undefined) payload[key] = args[key];
+          if (args[key] != null) payload[key] = args[key];
         }
-        if (args.body !== undefined) payload.isHTML = args.html || false;
+        if (args.body != null) payload.isHTML = args.html || false;
         if (args.from) payload.identityId = args.from;
+        const attachments = readAttachmentFiles(args.attachments);
         if (attachments?.length) payload.attachments = attachments;
         if (args.removeAttachments?.length) payload.removeAttachments = args.removeAttachments;
         return await composeCall(api, "/drafts/update", applyMode(payload, args.mode));
@@ -487,6 +501,7 @@ export const tools = [
           code: "INVALID_ARGS",
         });
       }
+      const attachments = readAttachmentFiles(args.attachments);
       const payload = {
         to: args.to,
         subject: args.subject || "",

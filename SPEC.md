@@ -367,7 +367,7 @@ request. `POST /messages/delete { messageIds, permanent? }` stays at policy `ful
 `permanent` it, too, moves to the trash).
 
 These are separate routes, not flags on `/messages/delete`, on purpose: an extension older than
-2.1.1.6 answers `Not found` to an unknown route, but would ignore an unknown `draftsOnly` flag and
+2.1.1.7 answers `Not found` to an unknown route, but would ignore an unknown `draftsOnly` flag and
 delete whatever it was given.
 
 ```bash
@@ -520,7 +520,7 @@ tb bulk move <sourceFolderId> <destFolderId> [options]
   --limit <n>
 
 # Bulk delete
-tb bulk delete <folderId> [options]
+tb bulk delete <folderId> [options]   # moves to the account's Trash
   --older-than <days>
   --from <address>
   --confirm                # required for delete operations
